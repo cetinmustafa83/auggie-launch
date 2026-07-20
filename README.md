@@ -60,6 +60,8 @@ on Deno at runtime.
 # 1. Install wrapper in ~/.local/bin and create user config template
 ./install.sh
 
+
+
 # 2. Edit user config
 $EDITOR ~/.config/auggie-launch/.env
 
@@ -68,6 +70,7 @@ export PATH="$HOME/.local/bin:$PATH"
 auggie-launch
 auggie-launch --print "hello"
 ```
+`./install.sh` also auto-installs the upstream CLI when it is missing (use `--skip-cli` to opt out).
 
 Project-local config is supported:
 
