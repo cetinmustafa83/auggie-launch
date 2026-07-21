@@ -10,8 +10,10 @@ and launches the installed `auggie` binary with local Augment session env vars.
 
 from __future__ import annotations
 
+from email.utils import parsedate_to_datetime
 import json
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -45,6 +47,16 @@ DEBUG_DIR = ""
 PORT = 0
 UPSTREAM_USER_AGENT = "codex-cli"
 UPSTREAM_APP_NAME = "Codex"
+UPSTREAM_MIN_INTERVAL_SECONDS = 0.25
+UPSTREAM_RETRIES = 2
+UPSTREAM_429_FREEZE_SECONDS = 60.0
+UPSTREAM_5XX_FREEZE_SECONDS = 30.0
+UPSTREAM_MAX_RETRY_AFTER_SECONDS = 300.0
+UPSTREAM_BACKOFF_INITIAL_SECONDS = 1.0
+UPSTREAM_BACKOFF_MAX_SECONDS = 30.0
+UPSTREAM_NEXT_REQUEST_AT = 0.0
+UPSTREAM_COOLDOWN_UNTIL = 0.0
+UPSTREAM_THROTTLE_LOCK = threading.Lock()
 SANITIZE_UPSTREAM_PROMPTS = False
 INDEXING_MODE = "complete"
 MODEL_CONTEXT_TOKENS = 200000
@@ -148,6 +160,10 @@ def load_config() -> None:
     global TARGET_BASE_URL, TARGET_MODEL, TARGET_API_KEY, API_KEYS, AUGGIE_BIN
     global LOCAL_TOKEN, VERBOSE, DEBUG_DIR, PORT, _LOADED_ENV_FILES
     global UPSTREAM_USER_AGENT, UPSTREAM_APP_NAME, SANITIZE_UPSTREAM_PROMPTS
+    global UPSTREAM_MIN_INTERVAL_SECONDS, UPSTREAM_RETRIES
+    global UPSTREAM_429_FREEZE_SECONDS, UPSTREAM_5XX_FREEZE_SECONDS
+    global UPSTREAM_MAX_RETRY_AFTER_SECONDS, UPSTREAM_BACKOFF_INITIAL_SECONDS
+    global UPSTREAM_BACKOFF_MAX_SECONDS
     global INDEXING_MODE, MODEL_CONTEXT_TOKENS, MODEL_MAX_OUTPUT_TOKENS, REASONING_EFFORT
 
     _LOADED_ENV_FILES = load_dotenv_files()
@@ -178,6 +194,13 @@ def load_config() -> None:
     PORT = env_int("AUGGIE_LAUNCH_PORT", 0)
     UPSTREAM_USER_AGENT = (os.environ.get("AUGGIE_LAUNCH_USER_AGENT") or "codex-cli").strip()
     UPSTREAM_APP_NAME = (os.environ.get("AUGGIE_LAUNCH_UPSTREAM_APP_NAME") or "Codex").strip()
+    UPSTREAM_MIN_INTERVAL_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_UPSTREAM_MIN_INTERVAL_SECONDS"), 0.25)
+    UPSTREAM_RETRIES = bounded_int(os.environ.get("AUGGIE_LAUNCH_UPSTREAM_RETRIES"), 2)
+    UPSTREAM_429_FREEZE_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_429_FREEZE_SECONDS"), 60.0)
+    UPSTREAM_5XX_FREEZE_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_5XX_FREEZE_SECONDS"), 30.0)
+    UPSTREAM_MAX_RETRY_AFTER_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_MAX_RETRY_AFTER_SECONDS"), 300.0)
+    UPSTREAM_BACKOFF_INITIAL_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_BACKOFF_INITIAL_SECONDS"), 1.0)
+    UPSTREAM_BACKOFF_MAX_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_BACKOFF_MAX_SECONDS"), 30.0)
     SANITIZE_UPSTREAM_PROMPTS = env_truthy("AUGGIE_LAUNCH_SANITIZE_UPSTREAM_PROMPTS", False)
     INDEXING_MODE = (os.environ.get("AUGGIE_LAUNCH_INDEXING_MODE") or "complete").strip().lower()
     MODEL_CONTEXT_TOKENS = env_int("AUGGIE_LAUNCH_MODEL_CONTEXT_TOKENS", 200000)
@@ -186,6 +209,95 @@ def load_config() -> None:
     if REASONING_EFFORT and REASONING_EFFORT not in {"low", "medium", "high"}:
         print("error: AUGGIE_LAUNCH_REASONING_EFFORT must be low, medium, or high", file=sys.stderr)
         sys.exit(2)
+
+
+def bounded_float(value: str | None, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        parsed = float(value) if value is not None and value.strip() else default
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def bounded_int(value: str | None, default: int, *, minimum: int = 0) -> int:
+    try:
+        parsed = int(value) if value is not None and value.strip() else default
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def parse_retry_after(value: str | None, *, now: float | None = None) -> float | None:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return None
+        return max(0.0, dt.timestamp() - (time.time() if now is None else now))
+    except Exception:
+        return None
+
+
+def clamp_retry_delay(delay: float | None, fallback: float) -> float:
+    selected = fallback if delay is None else delay
+    return min(max(0.0, selected), UPSTREAM_MAX_RETRY_AFTER_SECONDS)
+
+
+def retry_backoff_seconds(attempt: int) -> float:
+    base = min(UPSTREAM_BACKOFF_MAX_SECONDS, UPSTREAM_BACKOFF_INITIAL_SECONDS * (2 ** max(0, attempt)))
+    return base + random.uniform(0.0, min(1.0, base * 0.25))
+
+
+def apply_upstream_cooldown(seconds: float, reason: str) -> None:
+    if seconds <= 0:
+        return
+    capped = min(seconds, UPSTREAM_MAX_RETRY_AFTER_SECONDS)
+    with UPSTREAM_THROTTLE_LOCK:
+        global UPSTREAM_COOLDOWN_UNTIL
+        until = time.time() + capped
+        if until > UPSTREAM_COOLDOWN_UNTIL:
+            UPSTREAM_COOLDOWN_UNTIL = until
+    log(f"upstream cooldown {capped:.2f}s ({reason})")
+
+
+def wait_for_upstream_slot() -> None:
+    global UPSTREAM_NEXT_REQUEST_AT
+    while True:
+        with UPSTREAM_THROTTLE_LOCK:
+            now = time.time()
+            wait_until = max(UPSTREAM_COOLDOWN_UNTIL, UPSTREAM_NEXT_REQUEST_AT)
+            wait_for = wait_until - now
+            if wait_for <= 0:
+                UPSTREAM_NEXT_REQUEST_AT = now + UPSTREAM_MIN_INTERVAL_SECONDS
+                return
+        time.sleep(min(wait_for, 5.0))
+
+
+def is_retryable_upstream_status(status_code: int) -> bool:
+    return status_code == 429 or 500 <= status_code <= 599
+
+
+def compact_upstream_error(message: str, *, max_chars: int = 1000) -> str:
+    text = (message or "").strip()
+    lower = text.lower()
+    if "<html" in lower or "<!doctype html" in lower:
+        title = ""
+        title_start = lower.find("<title>")
+        title_end = lower.find("</title>")
+        if 0 <= title_start < title_end:
+            title = text[title_start + len("<title>"):title_end].strip()
+        text = f"HTML upstream error page: {title}" if title else "HTML upstream error page returned by gateway"
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "..."
+    return text
 
 
 def get_active_key() -> str:
@@ -197,15 +309,21 @@ def get_active_key() -> str:
         return API_KEYS[0]
 
 
-def mark_key_failed(key: str, status_code: int) -> None:
+def mark_key_failed(key: str, status_code: int, retry_after: str | None = None) -> float:
     with FROZEN_LOCK:
         now = time.time()
         if status_code == 429:
-            FROZEN_KEYS[key] = now + 60
+            freeze_for = clamp_retry_delay(parse_retry_after(retry_after, now=now), UPSTREAM_429_FREEZE_SECONDS)
+            FROZEN_KEYS[key] = now + freeze_for
+            return freeze_for
         elif status_code in (401, 402):
             FROZEN_KEYS[key] = now + 86400
-        elif status_code in (502, 503, 504):
-            FROZEN_KEYS[key] = now + 30
+            return 86400.0
+        elif 500 <= status_code <= 599:
+            freeze_for = UPSTREAM_5XX_FREEZE_SECONDS
+            FROZEN_KEYS[key] = now + freeze_for
+            return freeze_for
+    return 0.0
 
 
 def log(message: str) -> None:
@@ -572,6 +690,49 @@ def upstream_request(body: Any, *, stream: bool) -> urllib.request.Request:
     return req
 
 
+def open_upstream_with_retries(data: bytes, *, stream: bool, timeout: int, label: str) -> Any:
+    last_error: Exception | None = None
+    max_attempts = max(len(API_KEYS), 1) + max(0, UPSTREAM_RETRIES)
+    for attempt in range(max_attempts):
+        api_key = get_active_key()
+        log(f"{label} upstream attempt={attempt + 1}/{max_attempts} key={api_key[:10]}...")
+        req = urllib.request.Request(
+            upstream_url(),
+            data=data,
+            method="POST",
+            headers=upstream_headers(api_key, stream=stream),
+        )
+        try:
+            wait_for_upstream_slot()
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            frozen_for = mark_key_failed(api_key, exc.code, retry_after)
+            last_error = exc
+            if exc.code == 429:
+                cooldown = clamp_retry_delay(
+                    parse_retry_after(retry_after),
+                    min(frozen_for or UPSTREAM_429_FREEZE_SECONDS, retry_backoff_seconds(attempt)),
+                )
+                apply_upstream_cooldown(cooldown, "429 rate limit")
+            elif 500 <= exc.code <= 599:
+                apply_upstream_cooldown(retry_backoff_seconds(attempt), f"{exc.code} upstream error")
+            if is_retryable_upstream_status(exc.code) and attempt < max_attempts - 1:
+                continue
+            if exc.code in (401, 402) and attempt < min(len(API_KEYS), max_attempts) - 1:
+                continue
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_attempts - 1:
+                apply_upstream_cooldown(retry_backoff_seconds(attempt), "transport error")
+                continue
+            break
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("upstream request failed")
+
+
 def extract_chat_text(data: Any) -> str:
     if not isinstance(data, dict):
         return ""
@@ -830,15 +991,8 @@ class AuggieProxy(BaseHTTPRequestHandler):
                 json.dump(body, f, ensure_ascii=False, indent=2)
             with open(os.path.join(DEBUG_DIR, "outgoing_openai_request.json"), "w", encoding="utf-8") as f:
                 json.dump(openai_request, f, ensure_ascii=False, indent=2)
-        api_key = get_active_key()
         try:
-            req = urllib.request.Request(
-                upstream_url(),
-                data=json_bytes(openai_request),
-                method="POST",
-                headers=upstream_headers(api_key, stream=False),
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with open_upstream_with_retries(json_bytes(openai_request), stream=False, timeout=300, label="json") as resp:
                 raw = resp.read()
             data = json.loads(raw.decode("utf-8") or "{}")
             text = extract_chat_text(data)
@@ -850,11 +1004,10 @@ class AuggieProxy(BaseHTTPRequestHandler):
                     tool_calls = [call for call in message["tool_calls"] if isinstance(call, dict)]
             self.send_json(augment_chat_response(text, str(uuid.uuid4()), openai_request, data.get("usage") if isinstance(data, dict) else None, tool_calls))
         except urllib.error.HTTPError as exc:
-            mark_key_failed(api_key, exc.code)
-            raw = exc.read().decode("utf-8", errors="replace")[:2000]
+            raw = compact_upstream_error(exc.read().decode("utf-8", errors="replace"), max_chars=2000)
             self.send_json({"error": "upstream_error", "message": raw, "status": exc.code}, status=502 if exc.code in {401, 403} else exc.code)
         except Exception as exc:
-            self.send_json({"error": "upstream_error", "message": str(exc)}, status=502)
+            self.send_json({"error": "upstream_error", "message": compact_upstream_error(str(exc))}, status=502)
 
     def forward_stream(self, body: Any) -> None:
         openai_request = build_openai_request(body, stream=True)
@@ -864,8 +1017,17 @@ class AuggieProxy(BaseHTTPRequestHandler):
                 json.dump(body, f, ensure_ascii=False, indent=2)
             with open(os.path.join(DEBUG_DIR, "outgoing_openai_request.json"), "w", encoding="utf-8") as f:
                 json.dump(openai_request, f, ensure_ascii=False, indent=2)
-        api_key = get_active_key()
         request_id = str(uuid.uuid4())
+        try:
+            upstream_resp = open_upstream_with_retries(json_bytes(openai_request), stream=True, timeout=300, label="stream")
+        except urllib.error.HTTPError as exc:
+            msg = compact_upstream_error(exc.read().decode("utf-8", errors="replace"), max_chars=2000)
+            self.send_json({"error": "upstream_error", "message": msg, "status": exc.code, "request_id": request_id}, status=502 if exc.code in {401, 403} else exc.code)
+            return
+        except Exception as exc:
+            self.send_json({"error": "upstream_error", "message": compact_upstream_error(str(exc)), "request_id": request_id}, status=502)
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -884,13 +1046,7 @@ class AuggieProxy(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
-            req = urllib.request.Request(
-                upstream_url(),
-                data=json_bytes(openai_request),
-                method="POST",
-                headers=upstream_headers(api_key, stream=True),
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with upstream_resp as resp:
                 write_chunk({"text": "", "heartbeat": True, "request_id": request_id})
                 for raw_line in resp:
                     line = raw_line.decode("utf-8", errors="replace").strip()
@@ -923,12 +1079,8 @@ class AuggieProxy(BaseHTTPRequestHandler):
                     if delta_text:
                         accumulated.append(delta_text)
                         write_chunk({"text": delta_text, "delta": delta_text, "request_id": request_id})
-        except urllib.error.HTTPError as exc:
-            mark_key_failed(api_key, exc.code)
-            msg = exc.read().decode("utf-8", errors="replace")[:2000]
-            write_chunk({"error": "upstream_error", "message": msg, "status": exc.code, "request_id": request_id})
         except Exception as exc:
-            write_chunk({"error": "upstream_error", "message": str(exc), "request_id": request_id})
+            write_chunk({"error": "upstream_error", "message": compact_upstream_error(str(exc)), "request_id": request_id})
         finally:
             final_text = "".join(accumulated)
             final = augment_chat_response(final_text, request_id, openai_request, usage, tool_calls)
