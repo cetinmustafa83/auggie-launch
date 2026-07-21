@@ -112,13 +112,13 @@ auggie-launch --print "hello"
 ### `.env` load priority
 
 1. `AUGGIE_LAUNCH_ENV` if set
-2. `./.env` or `./.auggie-launch.env` in the current directory
-3. Parent directories, up to 6 levels
-4. Repo-local `.env`
+2. Package directory `.env` (launcher-local, next to `main.py`)
+3. `./.env` or `./.auggie-launch.env` (cwd)
+4. Parent directories (up to 6 levels)
 5. `~/.config/auggie-launch/.env`
 6. `~/.auggie-launch.env`
 
-Shell-exported variables win over values loaded from `.env` files.
+For auggie-launch-managed keys (`AUGGIE_LAUNCH_*` and `AUGGIE_BIN`), higher-priority `.env` files override stale shell exports.
 
 ## Usage
 

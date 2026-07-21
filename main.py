@@ -33,6 +33,8 @@ _REQUIRED_KEYS = (
     "AUGGIE_LAUNCH_BASE_URL",
     "AUGGIE_LAUNCH_MODEL",
 )
+_MANAGED_ENV_PREFIXES = ("AUGGIE_LAUNCH_",)
+_MANAGED_ENV_KEYS = {"AUGGIE_BIN"}
 
 TARGET_BASE_URL = ""
 TARGET_MODEL = ""
@@ -123,9 +125,13 @@ def _candidate_env_paths() -> list[str]:
     return unique
 
 
+def _is_managed_env_key(key: str) -> bool:
+    return key in _MANAGED_ENV_KEYS or key.startswith(_MANAGED_ENV_PREFIXES)
+
+
 def load_dotenv_files() -> list[str]:
     loaded: list[str] = []
-    claimed = set(os.environ.keys())
+    claimed = {key for key in os.environ.keys() if not _is_managed_env_key(key)}
     for path in _candidate_env_paths():
         if not os.path.isfile(path):
             continue
