@@ -13,6 +13,7 @@ from __future__ import annotations
 from email.utils import parsedate_to_datetime
 import json
 import os
+import platform
 import random
 import socket
 import subprocess
@@ -65,6 +66,9 @@ MODEL_CONTEXT_TOKENS = 200000
 MODEL_MAX_OUTPUT_TOKENS = 16000
 REASONING_EFFORT = ""
 _LOADED_ENV_FILES: list[str] = []
+_CODEX_SESSION_ID = f"session-{uuid.uuid4()}"
+_CODEX_THREAD_ID = str(uuid.uuid4())
+_CODEX_INSTALLATION_ID = str(uuid.uuid4())
 
 
 def _parse_dotenv(path: str) -> dict[str, str]:
@@ -154,6 +158,61 @@ def env_truthy(name: str, fallback: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def codex_version() -> str:
+    configured = (os.environ.get("CODEX_VERSION") or "").strip()
+    if configured:
+        return configured
+    codex_bin = (os.environ.get("CODEX_BIN") or "codex").strip() or "codex"
+    try:
+        result = subprocess.run(
+            [codex_bin, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return "0.144.6"
+    for token in result.stdout.replace("v", " v").split():
+        candidate = token.lstrip("v")
+        parts = candidate.split(".")
+        if len(parts) >= 2 and all(part.isdigit() for part in parts[:2]):
+            return candidate
+    return "0.144.6"
+
+
+def codex_user_agent() -> str:
+    originator = (os.environ.get("CODEX_ORIGINATOR") or "codex_cli_rs").strip() or "codex_cli_rs"
+    version = codex_version()
+    system = platform.system() or "Unknown"
+    release = platform.release() or "unknown"
+    arch = platform.machine() or "unknown"
+    return f"{originator}/{version} ({system} {release}; {arch})"
+
+
+def default_upstream_user_agent(fallback: str) -> str:
+    if env_truthy("CODEX_HEAD"):
+        return (os.environ.get("CODEX_USER_AGENT") or codex_user_agent()).strip()
+    return fallback
+
+
+def with_codex_headers(headers: dict[str, str]) -> dict[str, str]:
+    if not env_truthy("CODEX_HEAD"):
+        return headers
+
+    out = dict(headers)
+    out["User-Agent"] = out.get("User-Agent") or codex_user_agent()
+    out.setdefault("Originator", (os.environ.get("CODEX_ORIGINATOR") or "codex_cli_rs").strip() or "codex_cli_rs")
+    out.setdefault("session-id", (os.environ.get("CODEX_SESSION_ID") or _CODEX_SESSION_ID).strip())
+    out.setdefault("thread-id", (os.environ.get("CODEX_THREAD_ID") or _CODEX_THREAD_ID).strip())
+    out.setdefault("x-codex-installation-id", (os.environ.get("CODEX_INSTALLATION_ID") or _CODEX_INSTALLATION_ID).strip())
+    beta = (os.environ.get("CODEX_OPENAI_BETA") or "").strip()
+    if beta:
+        out.setdefault("OpenAI-Beta", beta)
+    return out
+
+
 def env_int(name: str, fallback: int) -> int:
     try:
         value = int((os.environ.get(name) or "").strip())
@@ -198,7 +257,7 @@ def load_config() -> None:
     VERBOSE = env_truthy("AUGGIE_LAUNCH_VERBOSE")
     DEBUG_DIR = (os.environ.get("AUGGIE_LAUNCH_DEBUG_DIR") or os.path.join(tempfile.gettempdir(), "auggie-launch")).strip()
     PORT = env_int("AUGGIE_LAUNCH_PORT", 0)
-    UPSTREAM_USER_AGENT = (os.environ.get("AUGGIE_LAUNCH_USER_AGENT") or "codex-cli").strip()
+    UPSTREAM_USER_AGENT = (os.environ.get("AUGGIE_LAUNCH_USER_AGENT") or default_upstream_user_agent("codex-cli")).strip()
     UPSTREAM_APP_NAME = (os.environ.get("AUGGIE_LAUNCH_UPSTREAM_APP_NAME") or "Codex").strip()
     UPSTREAM_MIN_INTERVAL_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_UPSTREAM_MIN_INTERVAL_SECONDS"), 0.25)
     UPSTREAM_RETRIES = bounded_int(os.environ.get("AUGGIE_LAUNCH_UPSTREAM_RETRIES"), 2)
@@ -643,10 +702,61 @@ def tool_calls_to_nodes(tool_calls: list[dict[str, Any]], *, starting_id: int = 
     return nodes
 
 
+def estimate_msg_char_count(msg: dict[str, Any]) -> int:
+    cnt = len(str(msg.get("content") or ""))
+    for tc in msg.get("tool_calls") or []:
+        if isinstance(tc, dict):
+            fn = tc.get("function") or {}
+            cnt += len(str(fn.get("name") or "")) + len(str(fn.get("arguments") or ""))
+    return cnt
+
+
+def truncate_messages_to_context_limit(messages: list[dict[str, Any]], max_context_tokens: int) -> list[dict[str, Any]]:
+    if not messages or max_context_tokens <= 0:
+        return messages
+
+    max_input_tokens = max(10000, max_context_tokens - 16384)
+    budget_chars = int(max_input_tokens * 3.2)
+
+    total_chars = sum(estimate_msg_char_count(m) for m in messages)
+    if total_chars <= budget_chars:
+        return messages
+
+    print(f"[auggie-launch] total prompt chars ({total_chars}) exceeds safe budget ({budget_chars}), truncating context...", file=sys.stderr)
+
+    system_msg = messages[0] if messages[0].get("role") == "system" else None
+    last_msg = messages[-1]
+
+    kept_head: list[dict[str, Any]] = [system_msg] if system_msg else []
+    middle_msgs = messages[1 if system_msg else 0 : -1]
+
+    current_budget = budget_chars - sum(estimate_msg_char_count(m) for m in kept_head) - estimate_msg_char_count(last_msg)
+
+    kept_middle: list[dict[str, Any]] = []
+    for m in reversed(middle_msgs):
+        cost = estimate_msg_char_count(m)
+        if current_budget - cost >= 0:
+            kept_middle.append(m)
+            current_budget -= cost
+        else:
+            if cost > current_budget and current_budget > 1000 and isinstance(m.get("content"), str):
+                m_copy = dict(m)
+                m_copy["content"] = m["content"][:current_budget] + "\n... [truncated due to context limit]"
+                kept_middle.append(m_copy)
+            break
+
+    kept_middle.reverse()
+    return kept_head + kept_middle + [last_msg]
+
+
 def build_openai_request(body: Any, *, stream: bool) -> dict[str, Any]:
+    raw_messages = build_openai_messages(body)
+    limit = MODEL_CONTEXT_TOKENS if MODEL_CONTEXT_TOKENS > 0 else 200000
+    messages = truncate_messages_to_context_limit(raw_messages, limit)
+
     request: dict[str, Any] = {
         "model": TARGET_MODEL,
-        "messages": build_openai_messages(body),
+        "messages": messages,
         "stream": stream,
     }
     tools = build_openai_tools(body)
@@ -676,7 +786,7 @@ def upstream_headers(api_key: str, *, stream: bool) -> dict[str, str]:
     }
     if UPSTREAM_USER_AGENT:
         headers["User-Agent"] = UPSTREAM_USER_AGENT
-    return headers
+    return with_codex_headers(headers)
 
 
 def upstream_url() -> str:
