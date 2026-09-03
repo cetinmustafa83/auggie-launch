@@ -10,4 +10,11 @@ tmp/
 .omc/
 .lemoncrow/
 .remember/
+.token-optimizer/
+__pycache__/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
 9router/
