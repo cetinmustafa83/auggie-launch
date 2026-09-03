@@ -1,0 +1,13 @@
+.env
+.env.bak
+*.log
+__pycache__/
+logs/
+tmp/
+.DS_Store
+.pytest_cache/
+.install-test/
+.omc/
+.lemoncrow/
+.remember/
+9router/
