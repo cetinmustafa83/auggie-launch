@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Comprehensive unit and offline test suite for auggie-launch modern LLM & 9router proxy techniques."""
 
-import io
 import json
 import os
 import shutil
@@ -9,7 +8,8 @@ import socket
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
-import main
+
+import auggie_launch as main
 
 
 class TestTokenAndAtomicTruncation(unittest.TestCase):
@@ -207,7 +207,7 @@ class TestAuggieFullInjections(unittest.TestCase):
         mcp_path = main.generate_injected_mcp_config()
         if mcp_path:
             self.assertTrue(os.path.isfile(mcp_path))
-            with open(mcp_path, "r", encoding="utf-8") as f:
+            with open(mcp_path, encoding="utf-8") as f:
                 data = json.load(f)
             self.assertIn("mcpServers", data)
 
@@ -220,7 +220,7 @@ class TestMockedNetworkOperations(unittest.TestCase):
         main.API_KEYS = ["sk-test-mock-key"]
         main.IS_9ROUTER = True
 
-    @patch("main._CONNECTION_POOL.acquire")
+    @patch("auggie_launch._CONNECTION_POOL.acquire")
     def test_dynamic_models_fetch_mocked(self, mock_acquire):
         mock_conn = MagicMock()
         mock_res = MagicMock()
@@ -246,7 +246,7 @@ class TestMockedNetworkOperations(unittest.TestCase):
         self.assertIn("claude-3-7-sonnet", model_ids)
         self.assertIn("deepseek-r1", model_ids)
 
-    @patch("main._CONNECTION_POOL.acquire")
+    @patch("auggie_launch._CONNECTION_POOL.acquire")
     def test_open_upstream_stream_with_reasoning_mocked(self, mock_acquire):
         mock_conn = MagicMock()
         mock_res = MagicMock()
@@ -269,10 +269,10 @@ class TestMockedNetworkOperations(unittest.TestCase):
         lines = [line.decode("utf-8").strip() for line in wrapper]
         wrapper.close()
 
-        self.assertTrue(any("Refactoring step..." in l for l in lines))
-        self.assertTrue(any("Final code." in l for l in lines))
+        self.assertTrue(any("Refactoring step..." in line for line in lines))
+        self.assertTrue(any("Final code." in line for line in lines))
 
-    @patch("main.fetch_upstream_models")
+    @patch("auggie_launch.fetch_upstream_models")
     def test_fake_models_dynamic_registry(self, mock_fetch):
         mock_fetch.return_value = [
             {"id": "free"},
@@ -292,7 +292,7 @@ class TestMockedNetworkOperations(unittest.TestCase):
         # Verify 9router local alias is in registry
         self.assertIn("big-pickle", registry)
 
-    @patch("main._CONNECTION_POOL.acquire")
+    @patch("auggie_launch._CONNECTION_POOL.acquire")
     def test_auto_parameter_swap_on_400(self, mock_acquire):
         mock_conn = MagicMock()
         res_fail = MagicMock()
@@ -363,41 +363,41 @@ class TestProviderApiKeyMapping(unittest.TestCase):
     def test_build_injected_environment_tavily(self):
         """Test tavily API key mapping."""
         with patch.dict(os.environ, {}, clear=True):
-            with patch('main._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"tavily": "tvly-test-key"})):
+            with patch('auggie_launch._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"tavily": "tvly-test-key"})):
                 env = main.build_injected_environment("http://localhost:50108")
                 self.assertEqual(env.get("TAVILY_API_KEY"), "tvly-test-key")
 
     def test_build_injected_environment_firecrawl(self):
         """Test firecrawl API key mapping."""
         with patch.dict(os.environ, {}, clear=True):
-            with patch('main._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"firecrawl": "fc-test-key"})):
+            with patch('auggie_launch._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"firecrawl": "fc-test-key"})):
                 env = main.build_injected_environment("http://localhost:50108")
                 self.assertEqual(env.get("FIRECRAWL_API_KEY"), "fc-test-key")
 
     def test_build_injected_environment_jina_reader(self):
         """Test jina-reader API key mapping (hyphen normalized)."""
         with patch.dict(os.environ, {}, clear=True):
-            with patch('main._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"jina-reader": "jina-test-key"})):
+            with patch('auggie_launch._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"jina-reader": "jina-test-key"})):
                 env = main.build_injected_environment("http://localhost:50108")
                 self.assertEqual(env.get("JINA_API_KEY"), "jina-test-key")
 
     def test_build_injected_environment_minimax(self):
         """Test minimax API key mapping."""
         with patch.dict(os.environ, {}, clear=True):
-            with patch('main._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"minimax": "mm-test-key"})):
+            with patch('auggie_launch._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"minimax": "mm-test-key"})):
                 env = main.build_injected_environment("http://localhost:50108")
                 self.assertEqual(env.get("MINIMAX_API_KEY"), "mm-test-key")
 
     def test_build_injected_environment_generic_fallback(self):
         """Test generic {NORM}_API_KEY fallback for unknown providers."""
         with patch.dict(os.environ, {}, clear=True):
-            with patch('main._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"custom-provider": "custom-key"})):
+            with patch('auggie_launch._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"custom-provider": "custom-key"})):
                 env = main.build_injected_environment("http://localhost:50108")
                 self.assertEqual(env.get("CUSTOM_PROVIDER_API_KEY"), "custom-key")
 
 
 class TestTunnelFallback(unittest.TestCase):
-    @patch("main.socket.socket")
+    @patch("auggie_launch.socket.socket")
     def test_tunnel_fallback_ping_success(self, mock_socket_class):
         """Test tunnel fallback ping returns True on success."""
         mock_sock = MagicMock()
@@ -408,7 +408,7 @@ class TestTunnelFallback(unittest.TestCase):
         self.assertTrue(result)
         mock_sock.connect.assert_called_once_with(("test.example.com", 443))
 
-    @patch("main.socket.socket")
+    @patch("auggie_launch.socket.socket")
     def test_tunnel_fallback_ping_failure(self, mock_socket_class):
         """Test tunnel fallback ping returns False on failure."""
         mock_sock = MagicMock()
@@ -441,7 +441,7 @@ class TestRuntimeTunnelFailover(unittest.TestCase):
         self.assertEqual(main.active_base_url(), "http://localhost:20128/v1")
         self.assertEqual(main.upstream_url(), "http://localhost:20128/v1/chat/completions")
 
-    @patch("main._ping_tunnel", return_value=True)
+    @patch("auggie_launch._ping_tunnel", return_value=True)
     def test_switch_to_tunnel_when_reachable(self, _ping):
         self.assertTrue(main.switch_to_tunnel("connection refused"))
         self.assertEqual(main.active_base_url(), "https://tunnel.example.com/v1")
@@ -449,7 +449,7 @@ class TestRuntimeTunnelFailover(unittest.TestCase):
         # second call is a no-op once already switched
         self.assertFalse(main.switch_to_tunnel("connection refused"))
 
-    @patch("main._ping_tunnel", return_value=False)
+    @patch("auggie_launch._ping_tunnel", return_value=False)
     def test_no_switch_when_tunnel_unreachable(self, _ping):
         self.assertFalse(main.switch_to_tunnel("connection refused"))
         self.assertEqual(main.active_base_url(), "http://localhost:20128/v1")
@@ -480,7 +480,7 @@ class Test9routerInstallAndRestore(unittest.TestCase):
         self.assertEqual(main.latest_bundled_db_backup(), self.backup)
 
     def test_restore_creates_db_when_missing(self):
-        with patch("main.os.path.expanduser", return_value=self.home):
+        with patch("auggie_launch.os.path.expanduser", return_value=self.home):
             self.assertTrue(main.restore_9router_db())
         db_file = os.path.join(self.home, ".9router", "db.json")
         self.assertTrue(os.path.isfile(db_file))
@@ -493,7 +493,7 @@ class Test9routerInstallAndRestore(unittest.TestCase):
         db_file = os.path.join(nine_dir, "db.json")
         with open(db_file, "w", encoding="utf-8") as f:
             json.dump({"settings": {"keep": True}}, f)
-        with patch("main.os.path.expanduser", return_value=self.home):
+        with patch("auggie_launch.os.path.expanduser", return_value=self.home):
             self.assertFalse(main.restore_9router_db())
             self.assertTrue(main.restore_9router_db(force=True))
         self.assertTrue(os.path.isfile(db_file + ".bak"))
@@ -503,35 +503,148 @@ class Test9routerInstallAndRestore(unittest.TestCase):
     def test_restore_rejects_non_9router_json(self):
         with open(self.backup, "w", encoding="utf-8") as f:
             json.dump({"not": "a db"}, f)
-        with patch("main.os.path.expanduser", return_value=self.home):
+        with patch("auggie_launch.os.path.expanduser", return_value=self.home):
             self.assertFalse(main.restore_9router_db())
 
-    @patch("main.subprocess.run")
-    @patch("main.shutil.which", return_value="/usr/local/bin/npm")
+    @patch("auggie_launch.subprocess.run")
+    @patch("auggie_launch.shutil.which", return_value="/usr/local/bin/npm")
     def test_install_9router_runs_npm_prefer_online(self, _which, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
-        with patch("main.find_9router_binary", return_value="/usr/local/bin/9router"):
+        with patch("auggie_launch.find_9router_binary", return_value="/usr/local/bin/9router"):
             self.assertTrue(main.install_9router())
         args = mock_run.call_args[0][0]
         self.assertEqual(args[1:], ["i", "-g", "9router@latest", "--prefer-online"])
 
-    @patch("main.shutil.which", return_value=None)
+    @patch("auggie_launch.shutil.which", return_value=None)
     def test_install_9router_without_npm(self, _which):
         self.assertFalse(main.install_9router())
 
-    @patch("main.subprocess.run")
-    @patch("main.shutil.which", return_value="/usr/local/bin/npm")
+    @patch("auggie_launch.subprocess.run")
+    @patch("auggie_launch.shutil.which", return_value="/usr/local/bin/npm")
     def test_install_9router_npm_failure(self, _which, mock_run):
         mock_run.return_value = MagicMock(returncode=1)
         self.assertFalse(main.install_9router())
 
-    @patch("main.install_9router", return_value=True)
-    @patch("main.restore_9router_db", return_value=True)
+    @patch("auggie_launch.install_9router", return_value=True)
+    @patch("auggie_launch.restore_9router_db", return_value=True)
     def test_ensure_installs_when_binary_missing(self, mock_restore, mock_install):
-        with patch("main.find_9router_binary", side_effect=[None, "/usr/local/bin/9router"]):
+        with patch("auggie_launch.find_9router_binary", side_effect=[None, "/usr/local/bin/9router"]):
             self.assertTrue(main.ensure_9router_installed())
         mock_install.assert_called_once()
         mock_restore.assert_called_once()
+
+
+class TestModelContextInjection(unittest.TestCase):
+    def setUp(self):
+        self._saved = (
+            main.TARGET_MODEL,
+            main.CACHED_CATALOG,
+            main._LOCAL_9ROUTER,
+            main.MODEL_CONTEXT_TOKENS,
+            main.MODEL_CONTEXT_TOKENS_EXPLICIT,
+            main.MODEL_MAX_OUTPUT_TOKENS,
+        )
+        main.TARGET_MODEL = "free"
+        main.MODEL_CONTEXT_TOKENS = 200000
+        main.MODEL_CONTEXT_TOKENS_EXPLICIT = False
+        main.MODEL_MAX_OUTPUT_TOKENS = 16000
+        main.CACHED_CATALOG = {
+            "big-model": {"contextWindow": 1000000},
+            "small-model": {"contextWindow": 32000},
+            "mid-model": {"contextWindow": 128000},
+        }
+        main._LOCAL_9ROUTER = main.NineRouterLocalState(
+            combos=[{"name": "free", "models": ["oc/big-model", "oc/small-model", "oc/mid-model"]}],
+            model_aliases={"fast-alias": "oc/big-model"},
+        )
+
+    def tearDown(self):
+        (
+            main.TARGET_MODEL,
+            main.CACHED_CATALOG,
+            main._LOCAL_9ROUTER,
+            main.MODEL_CONTEXT_TOKENS,
+            main.MODEL_CONTEXT_TOKENS_EXPLICIT,
+            main.MODEL_MAX_OUTPUT_TOKENS,
+        ) = self._saved
+
+    def test_combo_context_uses_weakest_member(self):
+        """A combo can fall back to any member, so its window is the smallest one."""
+        self.assertEqual(main.effective_context_limit("free"), 32000)
+
+    def test_alias_context_resolves_through_target(self):
+        self.assertEqual(main.effective_context_limit("fast-alias"), 1000000)
+
+    def test_explicit_env_override_wins(self):
+        main.MODEL_CONTEXT_TOKENS = 64000
+        main.MODEL_CONTEXT_TOKENS_EXPLICIT = True
+        self.assertEqual(main.effective_context_limit("free"), 64000)
+
+    def test_model_list_entry_budgets_track_context(self):
+        small = main.model_list_entry("small-model", 32000)
+        big = main.model_list_entry("big-model", 1000000)
+        self.assertEqual(small["suggested_prefix_char_count"], 32000)
+        self.assertEqual(big["suggested_prefix_char_count"], 200000)  # capped
+        self.assertEqual(small["suggested_prefix_char_count"], small["suggested_suffix_char_count"])
+
+    def test_fake_models_reports_per_model_context(self):
+        with patch("auggie_launch.DYNAMIC_MODELS", False):
+            payload = main.fake_models()
+        self.assertTrue(payload["models"])
+        names = {m["name"] for m in payload["models"]}
+        self.assertIn("free", names)
+        self.assertIn("fast-alias", names)
+        registry = json.loads(payload["feature_flags"]["model_info_registry"])
+        self.assertEqual(registry["free"]["context"], 32000)
+        self.assertEqual(registry["fast-alias"]["context"], 1000000)
+        entry = next(m for m in payload["models"] if m["name"] == "free")
+        self.assertEqual(entry["suggested_prefix_char_count"], 32000)
+
+    def test_resolve_request_model_honours_known_models(self):
+        self.assertEqual(main.resolve_request_model({"model": "fast-alias"}), "fast-alias")
+        self.assertEqual(main.resolve_request_model({"model": "who-is-this"}), "free")
+        self.assertEqual(main.resolve_request_model({}), "free")
+
+    def test_build_openai_request_caps_output_tokens(self):
+        request = main.build_openai_request(
+            {"model": "free", "message": "hi", "max_tokens": 900000},
+            stream=False,
+        )
+        self.assertEqual(request["model"], "free")
+        field = "max_completion_tokens" if "max_completion_tokens" in request else "max_tokens"
+        self.assertLessEqual(request[field], main.MODEL_MAX_OUTPUT_TOKENS)
+
+
+class TestLocalProxyAuthorization(unittest.TestCase):
+    def _handler(self, header_value=None):
+        handler = main.AuggieProxy.__new__(main.AuggieProxy)
+        handler.headers = {"Authorization": header_value} if header_value else {}
+        handler.send_json = MagicMock()
+        return handler
+
+    def test_health_and_token_paths_are_open(self):
+        handler = self._handler()
+        with patch("auggie_launch.REQUIRE_LOCAL_TOKEN", True):
+            self.assertTrue(handler.authorized("health"))
+            self.assertTrue(handler.authorized("token"))
+        handler.send_json.assert_not_called()
+
+    def test_valid_token_allowed(self):
+        handler = self._handler("Bearer secret-token")
+        with patch("auggie_launch.REQUIRE_LOCAL_TOKEN", True), patch("auggie_launch.LOCAL_TOKEN", "secret-token"):
+            self.assertTrue(handler.authorized("chat-stream"))
+
+    def test_missing_or_wrong_token_rejected(self):
+        handler = self._handler("Bearer nope")
+        with patch("auggie_launch.REQUIRE_LOCAL_TOKEN", True), patch("auggie_launch.LOCAL_TOKEN", "secret-token"):
+            self.assertFalse(handler.authorized("chat-stream"))
+        handler.send_json.assert_called_once()
+        self.assertEqual(handler.send_json.call_args.kwargs["status"], 401)
+
+    def test_enforcement_can_be_disabled(self):
+        handler = self._handler()
+        with patch("auggie_launch.REQUIRE_LOCAL_TOKEN", False):
+            self.assertTrue(handler.authorized("chat-stream"))
 
 
 if __name__ == "__main__":

@@ -58,15 +58,22 @@ backup in the repo's `9router/db/` folder when no live DB exists. Disable with
 
 ### Full Auggie CLI Injection
 
-The launcher injects four layers of configuration into Auggie:
+The launcher injects five layers of configuration into Auggie:
 
 1. **Environment variables** — standard OpenAI/Anthropic endpoints plus every active
    9router provider key (`TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, `MINIMAX_API_KEY`,
    `JINA_READER_API_KEY`, …, with a generic `{PROVIDER}_API_KEY` fallback).
-2. **Dynamic model registry** — all combos, aliases, and live upstream models, each with
+2. **Per-model context windows** — every model handed to Auggie carries its real window:
+   combos advertise the **smallest** context among their fallback members (a combo that can
+   drop to a 32k model is advertised as 32k, never 200k), aliases resolve through their
+   target, live models use `model-catalog.json` then heuristics, `suggested_prefix/suffix_char_count`
+   are derived from that window, and `max_tokens` / `max_completion_tokens` are clamped to it.
+   Requests keep the model Auggie asked for when the launcher advertises it; unknown names fall
+   back to `AUGGIE_LAUNCH_MODEL`. `AUGGIE_LAUNCH_MODEL_CONTEXT_TOKENS` overrides everything.
+3. **Dynamic model registry** — all combos, aliases, and live upstream models, each with
    per-model context limits and capabilities taken from the catalog.
-3. **Feature flags** — reasoning/thinking streaming, indexing mode, completion-token negotiation.
-4. **MCP tools** — an auto-generated MCP config when provider keys exist: Tavily (web search),
+4. **Feature flags** — reasoning/thinking streaming, indexing mode, completion-token negotiation.
+5. **MCP tools** — an auto-generated MCP config when provider keys exist: Tavily (web search),
    Firecrawl (web scraping), Sequential Thinking (structured reasoning).
 
 ### Verification Commands
@@ -133,6 +140,19 @@ AUGGIE_LAUNCH_BASE_URL=http://localhost:20128/v1
 AUGGIE_LAUNCH_MODEL=free
 AUGGIE_LAUNCH_API_KEY=your-9router-api-key
 ```
+
+### 1b. Install (optional)
+
+```bash
+./install.sh                 # wrapper in ~/.local/bin, config, CLI + 9router checks, self-test
+./install.sh --pipx          # additionally install the package in an isolated pipx env
+pipx install .               # or install the console script directly
+```
+
+`install.sh` verifies Python ≥ 3.10, byte-compiles the launcher before installing,
+installs the Auggie CLI and 9router when missing, seeds `~/.9router/db.json` from the
+bundled backup, and finishes with a self-test (`--help`, `--print-env`).
+Use `--skip-cli`, `--skip-9router`, `--skip-verify` to opt out of any step.
 
 ### 2. Run Doctor Health Check
 
@@ -225,6 +245,8 @@ python3 main.py --models
 | `AUGGIE_LAUNCH_UPSTREAM_RETRIES` | `2` | Number of retries on 429/5xx errors |
 | `AUGGIE_LAUNCH_429_FREEZE_SECONDS` | `60.0` | Key cooldown on rate limits |
 | `AUGGIE_LAUNCH_VERBOSE` | `0` | Enable verbose diagnostic logging |
+| `AUGGIE_LAUNCH_REQUIRE_LOCAL_TOKEN` | `true` | Reject local requests without the token injected into Auggie |
+| `AUGGIE_LAUNCH_LOCAL_TOKEN` | random per session | Pin the local proxy token instead of generating one |
 
 ---
 
@@ -249,10 +271,24 @@ Launcher options:
 
 ---
 
-## Testing
+## Security
 
-Run the included offline test suite:
+The proxy binds to `127.0.0.1` only and mints a **random per-session token** that it
+injects into the Auggie process. Every request except `/health` and the token endpoint
+must present it (`Authorization: Bearer …`), so no other local process can spend your
+upstream credits. Pin it with `AUGGIE_LAUNCH_LOCAL_TOKEN`, or disable the check with
+`AUGGIE_LAUNCH_REQUIRE_LOCAL_TOKEN=false`.
+
+---
+
+## Development
 
 ```bash
-python3 -m unittest -v test_modern_proxy.py
+python3 -m unittest -v test_modern_proxy   # offline test suite
+python3 -m ruff check .                    # lint
+python3 -m mypy                            # type check
+python3 -m build                           # build wheel/sdist
 ```
+
+CI runs the same steps on Python 3.10–3.13 (`.github/workflows/ci.yml`).
+See `CHANGELOG.md` for release notes and `LICENSE` for terms (research/learning only).

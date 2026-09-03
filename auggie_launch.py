@@ -11,13 +11,12 @@ and forwards chat/completion requests to OpenAI/Claude-compatible upstream endpo
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from email.utils import parsedate_to_datetime
 import http.client
 import json
 import os
 import platform
 import random
+import secrets
 import shutil
 import socket
 import subprocess
@@ -29,6 +28,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -40,6 +41,8 @@ _REQUIRED_KEYS = (
 )
 _MANAGED_ENV_PREFIXES = ("AUGGIE_LAUNCH_",)
 _MANAGED_ENV_KEYS = {"AUGGIE_BIN"}
+
+__version__ = "0.4.0"
 
 # --- Global Configurations ---
 TARGET_BASE_URL = ""
@@ -76,7 +79,9 @@ UPSTREAM_THROTTLE_LOCK = threading.Lock()
 SANITIZE_UPSTREAM_PROMPTS = False
 INDEXING_MODE = "complete"
 MODEL_CONTEXT_TOKENS = 200000
+MODEL_CONTEXT_TOKENS_EXPLICIT = False
 MODEL_MAX_OUTPUT_TOKENS = 16000
+REQUIRE_LOCAL_TOKEN = True
 REASONING_EFFORT = ""
 STREAM_THINKING = True
 
@@ -138,7 +143,7 @@ def read_local_9router_state() -> NineRouterLocalState:
     state.db_path = db_file
 
     try:
-        with open(db_file, "r", encoding="utf-8") as f:
+        with open(db_file, encoding="utf-8") as f:
             data = json.load(f)
 
         state.settings = data.get("settings") or {}
@@ -171,7 +176,7 @@ def read_local_9router_state() -> NineRouterLocalState:
     # Read model catalog for capabilities (vision, audio, pdf)
     if os.path.isfile(catalog_file):
         try:
-            with open(catalog_file, "r", encoding="utf-8") as f:
+            with open(catalog_file, encoding="utf-8") as f:
                 cat_data = json.load(f)
                 state.catalog_models = cat_data.get("models") or {}
         except Exception as exc:
@@ -377,9 +382,10 @@ def load_config() -> None:
     global UPSTREAM_MAX_RETRY_AFTER_SECONDS, UPSTREAM_BACKOFF_INITIAL_SECONDS
     global UPSTREAM_BACKOFF_MAX_SECONDS
     global INDEXING_MODE, MODEL_CONTEXT_TOKENS, MODEL_MAX_OUTPUT_TOKENS, REASONING_EFFORT
+    global MODEL_CONTEXT_TOKENS_EXPLICIT, REQUIRE_LOCAL_TOKEN
     global STREAM_THINKING, IS_9ROUTER, ROUTER_CAVEMAN_MODE, ROUTER_CAVEMAN_LEVEL
     global ROUTER_PROVIDER, DYNAMIC_MODELS, USE_COMPLETION_TOKENS, ENABLE_CONNECTION_POOL
-    global CACHED_CATALOG, _LOCAL_9ROUTER
+    global CACHED_CATALOG, _LOCAL_9ROUTER, AUTO_INJECT_MCP
 
     _LOADED_ENV_FILES = load_dotenv_files()
     _LOCAL_9ROUTER = read_local_9router_state()
@@ -389,7 +395,7 @@ def load_config() -> None:
     catalog_file = os.path.join(home, ".9router", "model-catalog.json")
     if os.path.isfile(catalog_file):
         try:
-            with open(catalog_file, "r", encoding="utf-8") as f:
+            with open(catalog_file, encoding="utf-8") as f:
                 cat_data = json.load(f)
                 global CACHED_CATALOG
                 CACHED_CATALOG = cat_data.get("models", {})
@@ -420,7 +426,7 @@ def load_config() -> None:
     if missing:
         xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
         print("error: missing required configuration: " + ", ".join(missing), file=sys.stderr)
-        print("Set them in ./.env or ~/.config/auggie-launch/.env", file=sys.stderr)
+        print(f"Set them in ./.env or {os.path.join(xdg, 'auggie-launch', '.env')}", file=sys.stderr)
         print(f"template: {os.path.join(_HERE, '.env.example')}", file=sys.stderr)
         sys.exit(2)
 
@@ -428,7 +434,9 @@ def load_config() -> None:
     TARGET_MODEL = os.environ["AUGGIE_LAUNCH_MODEL"].strip()
     TARGET_API_KEY = API_KEYS[0]
     AUGGIE_BIN = (os.environ.get("AUGGIE_BIN") or "auggie").strip()
-    LOCAL_TOKEN = (os.environ.get("AUGGIE_LAUNCH_LOCAL_TOKEN") or "fake-augment-access-token").strip()
+    # Per-session random token unless pinned: the proxy is loopback-only but still
+    # refuses requests that do not carry the token it injected into Auggie.
+    LOCAL_TOKEN = (os.environ.get("AUGGIE_LAUNCH_LOCAL_TOKEN") or f"al-{uuid.uuid4().hex}").strip()
     VERBOSE = env_truthy("AUGGIE_LAUNCH_VERBOSE")
     DEBUG_DIR = (os.environ.get("AUGGIE_LAUNCH_DEBUG_DIR") or os.path.join(tempfile.gettempdir(), "auggie-launch")).strip()
     PORT = env_int("AUGGIE_LAUNCH_PORT", 0)
@@ -445,6 +453,8 @@ def load_config() -> None:
     SANITIZE_UPSTREAM_PROMPTS = env_truthy("AUGGIE_LAUNCH_SANITIZE_UPSTREAM_PROMPTS", False)
     INDEXING_MODE = (os.environ.get("AUGGIE_LAUNCH_INDEXING_MODE") or "complete").strip().lower()
     MODEL_CONTEXT_TOKENS = env_int("AUGGIE_LAUNCH_MODEL_CONTEXT_TOKENS", 200000)
+    MODEL_CONTEXT_TOKENS_EXPLICIT = bool((os.environ.get("AUGGIE_LAUNCH_MODEL_CONTEXT_TOKENS") or "").strip())
+    REQUIRE_LOCAL_TOKEN = env_truthy("AUGGIE_LAUNCH_REQUIRE_LOCAL_TOKEN", True)
     MODEL_MAX_OUTPUT_TOKENS = env_int("AUGGIE_LAUNCH_MODEL_MAX_OUTPUT_TOKENS", 16000)
     REASONING_EFFORT = (os.environ.get("AUGGIE_LAUNCH_REASONING_EFFORT") or "").strip().lower()
     if REASONING_EFFORT and REASONING_EFFORT not in {"low", "medium", "high"}:
@@ -525,7 +535,6 @@ class ConversationTurn:
 
 def group_messages_into_turns(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[ConversationTurn]]:
     """Groups conversation messages into atomic turns.
-    
     CRITICAL: Never separates an assistant tool_call from its corresponding tool results!
     OpenAI and Anthropic APIs return 400 Bad Request if an assistant message with
     'tool_calls' is not immediately followed by tool messages responding to each tool_call_id.
@@ -545,11 +554,6 @@ def group_messages_into_turns(messages: list[dict[str, Any]]) -> tuple[list[dict
 
         if role == "assistant" and msg.get("tool_calls"):
             turn_msgs = [msg]
-            tool_ids = {
-                str(tc.get("id"))
-                for tc in msg["tool_calls"]
-                if isinstance(tc, dict) and tc.get("id")
-            }
             j = i + 1
             while j < len(messages) and str(messages[j].get("role") or "").lower() == "tool":
                 turn_msgs.append(messages[j])
@@ -587,7 +591,6 @@ def truncate_messages_to_context_limit(messages: list[dict[str, Any]], max_conte
         return system_msgs
 
     latest_turn = turns[-1]
-    kept_turns: list[ConversationTurn] = [latest_turn]
     remaining_budget = available_budget - system_tokens - latest_turn.estimated_tokens
 
     first_turn = turns[0] if len(turns) > 1 else None
@@ -703,6 +706,7 @@ def tool_calls_to_nodes(tool_calls: list[dict[str, Any]], *, starting_id: int = 
     node_id = starting_id
     for call in merge_stream_tool_calls(tool_calls):
         fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        fn = fn or {}
         name = fn.get("name")
         args = fn.get("arguments") if isinstance(fn.get("arguments"), str) else "{}"
         call_id = call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
@@ -835,6 +839,8 @@ def append_history_messages(messages: list[dict[str, Any]], body: Any) -> None:
             continue
         request_nodes = record.get("request_nodes") if isinstance(record.get("request_nodes"), list) else []
         response_nodes = record.get("response_nodes") if isinstance(record.get("response_nodes"), list) else []
+        request_nodes = request_nodes or []
+        response_nodes = response_nodes or []
         for node in request_nodes:
             tool_result = node_tool_result(node)
             if tool_result:
@@ -950,11 +956,14 @@ def should_use_completion_tokens(model_name: str) -> bool:
 
 def build_openai_request(body: Any, *, stream: bool, use_completion_tokens: bool | None = None) -> dict[str, Any]:
     raw_messages = build_openai_messages(body)
-    limit = MODEL_CONTEXT_TOKENS if MODEL_CONTEXT_TOKENS > 0 else 200000
+    model = resolve_request_model(body)
+    limit = effective_context_limit(model)
+    if limit <= 0:
+        limit = 200000
     messages = truncate_messages_to_context_limit(raw_messages, limit)
 
     request: dict[str, Any] = {
-        "model": TARGET_MODEL,
+        "model": model,
         "messages": messages,
         "stream": stream,
     }
@@ -966,15 +975,18 @@ def build_openai_request(body: Any, *, stream: bool, use_completion_tokens: bool
         request["stream_options"] = {"include_usage": True}
 
     tokens_field = "max_completion_tokens" if (
-        use_completion_tokens if use_completion_tokens is not None else should_use_completion_tokens(TARGET_MODEL)
+        use_completion_tokens if use_completion_tokens is not None else should_use_completion_tokens(model)
     ) else "max_tokens"
+
+    # Never ask for more output than the model's window can hold alongside the prompt.
+    output_ceiling = max(256, min(MODEL_MAX_OUTPUT_TOKENS, max(1024, limit // 4)))
 
     if isinstance(body, dict):
         if isinstance(body.get("temperature"), (int, float)):
             request["temperature"] = body["temperature"]
         max_tokens = body.get("max_tokens") or body.get("max_output_tokens")
         if isinstance(max_tokens, int) and max_tokens > 0:
-            request[tokens_field] = max_tokens
+            request[tokens_field] = min(max_tokens, output_ceiling)
         if isinstance(body.get("reasoning_effort"), str) and body["reasoning_effort"].strip():
             request["reasoning_effort"] = body["reasoning_effort"].strip().lower()
 
@@ -1312,7 +1324,7 @@ def open_upstream_with_retries(data: bytes, *, stream: bool, timeout: int, label
                     pass
 
             last_error = urllib.error.HTTPError(
-                upstream_url(), response.status, compact_upstream_error(error_body), response.headers, None  # type: ignore
+                upstream_url(), response.status, compact_upstream_error(error_body), response.headers, None
             )
 
             if response.status == 429:
@@ -1418,6 +1430,65 @@ def lookup_catalog_context(model_id: str) -> int:
                     return int(ctx)
     return 0
 
+def combo_context_limit(combo: dict[str, Any]) -> int:
+    """Safe context for a 9router combo: the smallest window across its fallback models.
+
+    A combo can be served by any member, so the usable context is the weakest one;
+    anything larger would 400 as soon as the combo falls back.
+    """
+    members = [m for m in (combo.get("models") or []) if isinstance(m, str)]
+    limits = [model_context_limit(m) for m in members]
+    limits = [limit for limit in limits if limit > 0]
+    if not limits:
+        return MODEL_CONTEXT_TOKENS if MODEL_CONTEXT_TOKENS > 0 else 200000
+    return min(limits)
+
+
+def effective_context_limit(model_id: str) -> int:
+    """Context budget actually used for truncation and injection for one model.
+
+    An explicit AUGGIE_LAUNCH_MODEL_CONTEXT_TOKENS always wins (operator override);
+    otherwise combos use their weakest member and everything else uses the catalog.
+    """
+    if MODEL_CONTEXT_TOKENS_EXPLICIT and MODEL_CONTEXT_TOKENS > 0:
+        return MODEL_CONTEXT_TOKENS
+    for combo in _LOCAL_9ROUTER.combos:
+        if combo.get("name") == model_id:
+            return combo_context_limit(combo)
+    alias_target = _LOCAL_9ROUTER.model_aliases.get(model_id)
+    if alias_target:
+        aliased = model_context_limit(alias_target)
+        if aliased > 0:
+            return aliased
+    return model_context_limit(model_id)
+
+
+def known_model_names() -> set[str]:
+    """Every model name the launcher advertises to Auggie."""
+    names = {TARGET_MODEL}
+    names.update(str(c.get("name")) for c in _LOCAL_9ROUTER.combos if c.get("name"))
+    names.update(_LOCAL_9ROUTER.model_aliases.keys())
+    names.update(
+        str(item.get("id")) for item in _CACHED_MODELS if isinstance(item, dict) and item.get("id")
+    )
+    return names
+
+
+def resolve_request_model(body: Any) -> str:
+    """Honours the model Auggie asked for when we advertise it, else the configured target."""
+    if not isinstance(body, dict):
+        return TARGET_MODEL
+    for key in ("model", "model_name", "internal_name", "modelName"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            candidate = value.strip()
+            if candidate in known_model_names():
+                return candidate
+            log(f"ignoring unknown requested model '{candidate}', using {TARGET_MODEL}")
+            break
+    return TARGET_MODEL
+
+
 def model_context_limit(model_id: str) -> int:
     """Heuristic context window for standard and 9router models, with catalog priority."""
     catalog_ctx = lookup_catalog_context(model_id)
@@ -1446,15 +1517,36 @@ def fake_token() -> dict[str, Any]:
     }
 
 
+def model_list_entry(model_id: str, context_tokens: int) -> dict[str, Any]:
+    """Auggie model descriptor whose completion budgets track the real context window.
+
+    Auggie sizes its prefix/suffix payloads from these counts, so deriving them from
+    the model's own window is what keeps large-context models usable and small ones
+    from overflowing upstream.
+    """
+    context = context_tokens if context_tokens > 0 else 200000
+    # ~4 chars/token: one quarter of the window per side leaves half the window
+    # for history, tool definitions and the response.
+    half_budget_chars = max(2000, min(200000, context))
+    return {
+        "name": model_id,
+        "internal_name": model_id,
+        "suggested_prefix_char_count": half_budget_chars,
+        "suggested_suffix_char_count": half_budget_chars,
+        "completion_timeout_ms": 600000,
+    }
+
+
 def fake_models() -> dict[str, Any]:
     """Builds comprehensive model list including all 9router combos, aliases, and catalog."""
-    models_list = [{"name": TARGET_MODEL, "internal_name": TARGET_MODEL, "suggested_prefix_char_count": 12000, "suggested_suffix_char_count": 12000, "completion_timeout_ms": 600000}]
+    target_context = effective_context_limit(TARGET_MODEL)
+    models_list = [model_list_entry(TARGET_MODEL, target_context)]
     model_registry: dict[str, Any] = {
         TARGET_MODEL: {
             "humanName": TARGET_MODEL,
             "description": f"{'9router' if IS_9ROUTER else 'OpenAI-compatible'} model via auggie-launch",
             "encoding": "o200k_base",
-            "context": MODEL_CONTEXT_TOKENS,
+            "context": target_context,
             "maxOutput": MODEL_MAX_OUTPUT_TOKENS,
         }
     }
@@ -1468,12 +1560,13 @@ def fake_models() -> dict[str, Any]:
             continue
         seen_models.add(cname)
         cmodels = combo.get("models") or []
-        models_list.append({"name": cname, "internal_name": cname, "suggested_prefix_char_count": 12000, "suggested_suffix_char_count": 12000, "completion_timeout_ms": 600000})
+        combo_context = combo_context_limit(combo)
+        models_list.append(model_list_entry(cname, combo_context))
         model_registry[cname] = {
             "humanName": f"9router: {cname} (Combo)",
             "description": f"Auto-fallback combo over {len(cmodels)} models: {', '.join(cmodels[:3])}...",
             "encoding": "o200k_base",
-            "context": 200000,
+            "context": combo_context,
             "maxOutput": MODEL_MAX_OUTPUT_TOKENS,
         }
 
@@ -1482,12 +1575,13 @@ def fake_models() -> dict[str, Any]:
         if not alias_name or alias_name in seen_models:
             continue
         seen_models.add(alias_name)
-        models_list.append({"name": alias_name, "internal_name": alias_name, "suggested_prefix_char_count": 12000, "suggested_suffix_char_count": 12000, "completion_timeout_ms": 600000})
+        alias_context = effective_context_limit(alias_name)
+        models_list.append(model_list_entry(alias_name, alias_context))
         model_registry[alias_name] = {
             "humanName": f"9router: {alias_name}",
             "description": f"Alias pointing to {real_target}",
             "encoding": "o200k_base",
-            "context": model_context_limit(alias_name),
+            "context": alias_context,
             "maxOutput": MODEL_MAX_OUTPUT_TOKENS,
         }
 
@@ -1499,12 +1593,13 @@ def fake_models() -> dict[str, Any]:
             if not mid or mid in seen_models:
                 continue
             seen_models.add(mid)
-            models_list.append({"name": mid, "internal_name": mid, "suggested_prefix_char_count": 12000, "suggested_suffix_char_count": 12000, "completion_timeout_ms": 600000})
+            mid_context = effective_context_limit(mid)
+            models_list.append(model_list_entry(mid, mid_context))
             model_registry[mid] = {
                 "humanName": mid,
                 "description": f"Model from {'9router' if IS_9ROUTER else 'upstream'}",
                 "encoding": "o200k_base",
-                "context": model_context_limit(mid),
+                "context": mid_context,
                 "maxOutput": MODEL_MAX_OUTPUT_TOKENS,
             }
 
@@ -1646,6 +1741,8 @@ def estimate_usage(request: dict[str, Any], usage: Any) -> dict[str, int]:
 
 def augment_usage(openai_request: dict[str, Any], usage: Any) -> dict[str, int]:
     basic = estimate_usage(openai_request, usage)
+    request_model = openai_request.get("model") if isinstance(openai_request, dict) else None
+    context_tokens = effective_context_limit(request_model) if isinstance(request_model, str) else MODEL_CONTEXT_TOKENS
     return {
         "input_tokens": basic["prompt_tokens"],
         "output_tokens": basic["completion_tokens"],
@@ -1657,7 +1754,7 @@ def augment_usage(openai_request: dict[str, Any], usage: Any) -> dict[str, int]:
         "tool_definitions_tokens": 0,
         "tool_result_tokens": 0,
         "assistant_response_tokens": basic["completion_tokens"],
-        "max_context_tokens": MODEL_CONTEXT_TOKENS,
+        "max_context_tokens": context_tokens or MODEL_CONTEXT_TOKENS,
         "max_output_tokens": MODEL_MAX_OUTPUT_TOKENS,
     }
 
@@ -1686,7 +1783,7 @@ def augment_chat_response(text: str, request_id: str, openai_request: dict[str, 
 
 
 class AuggieProxy(BaseHTTPRequestHandler):
-    server_version = "auggie-launch/0.3 (9router-native)"
+    server_version = f"auggie-launch/{__version__} (9router-native)"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -1725,6 +1822,27 @@ class AuggieProxy(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         return parsed.path.strip("/")
 
+    def authorized(self, path: str) -> bool:
+        """Rejects anything that does not carry the token injected into Auggie.
+
+        The proxy binds to loopback only, but any local process could otherwise
+        drive it (and spend upstream credits), so the token is checked on every
+        request except the unauthenticated health and token endpoints.
+        """
+        if not REQUIRE_LOCAL_TOKEN:
+            return True
+        if path in {"", "health"} or path in {"token", "auth/token"} or path.endswith("/token"):
+            return True
+        header = self.headers.get("Authorization") or self.headers.get("authorization") or ""
+        presented = header[7:].strip() if header.lower().startswith("bearer ") else header.strip()
+        if not presented:
+            presented = (self.headers.get("X-Api-Key") or "").strip()
+        if presented and secrets.compare_digest(presented, LOCAL_TOKEN):
+            return True
+        log(f"rejected unauthorized local request to /{path}")
+        self.send_json({"error": {"message": "unauthorized: missing or invalid local token"}}, status=401)
+        return False
+
     def do_HEAD(self) -> None:
         self.send_response(200)
         self.send_header("Content-Length", "0")
@@ -1732,11 +1850,13 @@ class AuggieProxy(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = self.normalized_path()
+        if not self.authorized(path):
+            return
         if path in {"", "health"}:
             self.send_json({
                 "ok": True,
                 "service": "auggie-launch",
-                "version": "0.3.0",
+                "version": __version__,
                 "router": "9router-native" if IS_9ROUTER else "standard",
                 "model": TARGET_MODEL,
                 "indexing_mode": INDEXING_MODE,
@@ -1750,6 +1870,8 @@ class AuggieProxy(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.normalized_path()
+        if not self.authorized(path):
+            return
         body = read_json(self)
         if VERBOSE:
             log(f"{self.command} /{path}")
@@ -1903,7 +2025,7 @@ class AuggieProxy(BaseHTTPRequestHandler):
                             else:
                                 delta_text = text_from_value(first.get("text"))
 
-                    # Düşünme (reasoning/thinking) akışı:
+                    # Reasoning / thinking stream:
                     if reasoning_text:
                         if STREAM_THINKING:
                             if not in_thinking_block:
@@ -2239,7 +2361,7 @@ def restore_9router_db(*, force: bool = False) -> bool:
         return False
 
     try:
-        with open(backup, "r", encoding="utf-8") as f:
+        with open(backup, encoding="utf-8") as f:
             payload = json.load(f)
         if not isinstance(payload, dict) or "settings" not in payload:
             print(f"[FAIL] Backup does not look like a 9router DB: {backup}")
@@ -2330,7 +2452,7 @@ def run_doctor_check() -> int:
                 t_port = t_parsed.port or (443 if t_parsed.scheme == "https" else 80)
                 print(f"   [OK] Tunnel reachable: {t_host}:{t_port}")
             else:
-                print(f"   [WARN] Tunnel also unreachable")
+                print("   [WARN] Tunnel also unreachable")
 
     # 3. Model Registry Discovery
     print("2. Querying Model Registry (/models)...")
@@ -2363,7 +2485,7 @@ def run_doctor_check() -> int:
                 latency = (time.time() - t0) * 1000
                 data = json.loads(raw.decode("utf-8"))
                 text = extract_chat_text(data)
-                print(f"   [OK] Upstream completion response in {latency:.1f}ms: {repr(text)}")
+                print(f"   [OK] Upstream completion response in {latency:.1f}ms: {text!r}")
                 log_router_response_headers(resp.headers)
         except Exception as exc:
             print(f"   [WARN] Completion request warning: {exc}")
@@ -2373,7 +2495,7 @@ def run_doctor_check() -> int:
     # 5. Auggie CLI binary check
     print("4. Checking Auggie CLI binary...")
     try:
-        res = subprocess.run([AUGGIE_BIN, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
+        res = subprocess.run([AUGGIE_BIN, "--version"], capture_output=True, text=True, timeout=3)
         if res.returncode == 0:
             print(f"   [OK] Auggie binary found: {AUGGIE_BIN} -> {res.stdout.strip()}")
         else:
@@ -2422,7 +2544,7 @@ def print_env(port: int) -> None:
     print(f"AUGGIE_LAUNCH_9ROUTER_LOCAL_DB={'true' if _LOCAL_9ROUTER.installed else 'false'}")
     print(f"AUGGIE_LAUNCH_9ROUTER_CAVEMAN={'true (' + ROUTER_CAVEMAN_LEVEL + ')' if ROUTER_CAVEMAN_MODE else 'false'}")
     print(f"AUGGIE_LAUNCH_9ROUTER_TUNNEL={_LOCAL_9ROUTER.tunnel_url or '(none)'}")
-    print(f"AUGGIE_LAUNCH_9ROUTER_COMBOS={','.join(c.get('name') for c in _LOCAL_9ROUTER.combos) or '(none)'}")
+    print(f"AUGGIE_LAUNCH_9ROUTER_COMBOS={','.join(str(c.get('name')) for c in _LOCAL_9ROUTER.combos if c.get('name')) or '(none)'}")
     print(f"AUGGIE_LAUNCH_9ROUTER_ALIASES={','.join(_LOCAL_9ROUTER.model_aliases.keys()) or '(none)'}")
     print(f"AUGGIE_LAUNCH_9ROUTER_PROVIDERS={','.join(_LOCAL_9ROUTER.provider_api_keys.keys()) or '(none)'}")
     print(f"AUGGIE_LAUNCH_INDEXING_MODE={INDEXING_MODE}")

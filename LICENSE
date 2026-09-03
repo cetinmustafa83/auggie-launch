@@ -1,0 +1,24 @@
+auggie-launch License (Research and Learning Only)
+SPDX-License-Identifier: LicenseRef-auggie-launch-Research-Only
+
+Copyright (c) 2026 auggie-launch contributors
+
+仅供学习与研究使用；其他用途后果自负。
+
+This software is provided for learning and research only. Any other use is at
+your own risk.
+
+Permission is granted to use, copy, and modify this software for personal
+learning and research purposes, provided that this notice is retained in all
+copies. Commercial use, redistribution as a product or service, and any use
+that violates the terms of service of the upstream providers it talks to
+(including but not limited to Augment Code and any model provider reached
+through it) are NOT granted by this license.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
