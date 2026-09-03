@@ -4,7 +4,9 @@
 import io
 import json
 import os
+import shutil
 import socket
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 import main
@@ -456,6 +458,80 @@ class TestRuntimeTunnelFailover(unittest.TestCase):
         main.TUNNEL_BASE_URL = ""
         self.assertFalse(main.switch_to_tunnel("connection refused"))
         self.assertEqual(main.active_base_url(), "http://localhost:20128/v1")
+
+
+class Test9routerInstallAndRestore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._saved_backup_dir = main._BUNDLED_DB_BACKUP_DIR
+        main._BUNDLED_DB_BACKUP_DIR = os.path.join(self.tmp, "backups")
+        os.makedirs(main._BUNDLED_DB_BACKUP_DIR)
+        self.backup = os.path.join(main._BUNDLED_DB_BACKUP_DIR, "9router-backup-test.json")
+        with open(self.backup, "w", encoding="utf-8") as f:
+            json.dump({"settings": {"cavemanEnabled": True}, "combos": []}, f)
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(self.home)
+
+    def tearDown(self):
+        main._BUNDLED_DB_BACKUP_DIR = self._saved_backup_dir
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_latest_bundled_db_backup(self):
+        self.assertEqual(main.latest_bundled_db_backup(), self.backup)
+
+    def test_restore_creates_db_when_missing(self):
+        with patch("main.os.path.expanduser", return_value=self.home):
+            self.assertTrue(main.restore_9router_db())
+        db_file = os.path.join(self.home, ".9router", "db.json")
+        self.assertTrue(os.path.isfile(db_file))
+        with open(db_file, encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["settings"]["cavemanEnabled"])
+
+    def test_restore_skips_existing_db_without_force(self):
+        nine_dir = os.path.join(self.home, ".9router")
+        os.makedirs(nine_dir)
+        db_file = os.path.join(nine_dir, "db.json")
+        with open(db_file, "w", encoding="utf-8") as f:
+            json.dump({"settings": {"keep": True}}, f)
+        with patch("main.os.path.expanduser", return_value=self.home):
+            self.assertFalse(main.restore_9router_db())
+            self.assertTrue(main.restore_9router_db(force=True))
+        self.assertTrue(os.path.isfile(db_file + ".bak"))
+        with open(db_file, encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["settings"]["cavemanEnabled"])
+
+    def test_restore_rejects_non_9router_json(self):
+        with open(self.backup, "w", encoding="utf-8") as f:
+            json.dump({"not": "a db"}, f)
+        with patch("main.os.path.expanduser", return_value=self.home):
+            self.assertFalse(main.restore_9router_db())
+
+    @patch("main.subprocess.run")
+    @patch("main.shutil.which", return_value="/usr/local/bin/npm")
+    def test_install_9router_runs_npm_prefer_online(self, _which, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        with patch("main.find_9router_binary", return_value="/usr/local/bin/9router"):
+            self.assertTrue(main.install_9router())
+        args = mock_run.call_args[0][0]
+        self.assertEqual(args[1:], ["i", "-g", "9router@latest", "--prefer-online"])
+
+    @patch("main.shutil.which", return_value=None)
+    def test_install_9router_without_npm(self, _which):
+        self.assertFalse(main.install_9router())
+
+    @patch("main.subprocess.run")
+    @patch("main.shutil.which", return_value="/usr/local/bin/npm")
+    def test_install_9router_npm_failure(self, _which, mock_run):
+        mock_run.return_value = MagicMock(returncode=1)
+        self.assertFalse(main.install_9router())
+
+    @patch("main.install_9router", return_value=True)
+    @patch("main.restore_9router_db", return_value=True)
+    def test_ensure_installs_when_binary_missing(self, mock_restore, mock_install):
+        with patch("main.find_9router_binary", side_effect=[None, "/usr/local/bin/9router"]):
+            self.assertTrue(main.ensure_9router_installed())
+        mock_install.assert_called_once()
+        mock_restore.assert_called_once()
 
 
 if __name__ == "__main__":

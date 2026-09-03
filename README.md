@@ -40,9 +40,21 @@ and `/models` — fails over to the tunnel for the rest of the process lifetime.
 
 | Command | Description |
 |---|---|
-| `--start-9router` | Attempts to start 9router from common install paths |
+| `--start-9router` | Starts 9router; installs it from npm first if the binary is missing |
+| `--install-9router` | `npm i -g 9router@latest --prefer-online`, then seeds the DB if absent |
+| `--update-9router` | Updates 9router to the latest npm release |
+| `--restore-9router-db` | Restores `~/.9router/db.json` from the newest backup in `9router/db/` (existing DB kept as `db.json.bak`) |
 | `--stats`, `--usage` | Queries `/api/usage` for live token savings, request counts, and provider breakdown |
 | `--combos` | Lists 9router combos and their fallback model groups |
+
+### Self-Healing Install
+
+If 9router is targeted but not detected on the system, the launcher installs it automatically
+(`npm i -g 9router@latest --prefer-online`) and restores `~/.9router/db.json` from the newest
+backup in the repo's `9router/db/` folder when no live DB exists. Disable with
+`AUGGIE_LAUNCH_AUTO_INSTALL_9ROUTER=false`.
+
+> The bundled DB backup holds live API keys, so `9router/` is git-ignored — keep it local.
 
 ### Full Auggie CLI Injection
 
@@ -193,6 +205,7 @@ python3 main.py --models
 | `AUGGIE_LAUNCH_DYNAMIC_MODELS` | `true` | Auto-query `/v1/models` and register all models in Auggie |
 | `AUGGIE_LAUNCH_9ROUTER_CAVEMAN` | `false` | Enable 9router Caveman mode (`X-Caveman-Mode: true`) |
 | `AUGGIE_LAUNCH_9ROUTER_PROVIDER` | `""` | Target specific provider (`X-Router-Provider: ...`) |
+| `AUGGIE_LAUNCH_AUTO_INSTALL_9ROUTER` | `true` | Auto-install 9router via npm when it is not detected |
 
 ### Modern LLM & Reasoning Settings
 
@@ -225,7 +238,10 @@ Launcher options:
   --models                    List all models discovered from 9router
   --combos                    List 9router combos and fallback groups
   --stats, --usage            Show 9router token savings and provider status
-  --start-9router             Start 9router background process
+  --start-9router             Start 9router (installs it via npm if missing)
+  --install-9router           Install 9router globally (npm i -g 9router@latest)
+  --update-9router            Update 9router to the latest npm release
+  --restore-9router-db        Restore ~/.9router/db.json from the bundled backup
   --print-env                 Show resolved config
   --proxy-only                Run only the local proxy in foreground
   --help, -h                  Show this help

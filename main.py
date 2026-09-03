@@ -18,6 +18,7 @@ import json
 import os
 import platform
 import random
+import shutil
 import socket
 import subprocess
 import sys
@@ -378,7 +379,7 @@ def load_config() -> None:
     global INDEXING_MODE, MODEL_CONTEXT_TOKENS, MODEL_MAX_OUTPUT_TOKENS, REASONING_EFFORT
     global STREAM_THINKING, IS_9ROUTER, ROUTER_CAVEMAN_MODE, ROUTER_CAVEMAN_LEVEL
     global ROUTER_PROVIDER, DYNAMIC_MODELS, USE_COMPLETION_TOKENS, ENABLE_CONNECTION_POOL
-    global CACHED_CATALOG
+    global CACHED_CATALOG, _LOCAL_9ROUTER
 
     _LOADED_ENV_FILES = load_dotenv_files()
     _LOCAL_9ROUTER = read_local_9router_state()
@@ -452,6 +453,11 @@ def load_config() -> None:
 
     STREAM_THINKING = env_truthy("AUGGIE_LAUNCH_STREAM_THINKING", True)
     IS_9ROUTER = detect_9router(TARGET_BASE_URL)
+
+    # Auto-install 9router when the system cannot detect it at all
+    if IS_9ROUTER and not _LOCAL_9ROUTER.installed and env_truthy("AUGGIE_LAUNCH_AUTO_INSTALL_9ROUTER", True):
+        if ensure_9router_installed():
+            _LOCAL_9ROUTER = read_local_9router_state()
 
     # Tunnel fallback target: 9router's Cloudflare URL + the local base path (e.g. /v1)
     global TUNNEL_BASE_URL, ACTIVE_BASE_URL
@@ -2122,27 +2128,149 @@ def print_9router_stats() -> None:
 def start_9router_daemon() -> None:
     """Attempts to launch 9router if not running."""
     print("Starting 9router service...")
-    home = os.path.expanduser("~")
-    cli_candidates = [
-        os.path.join(home, ".npm-global", "bin", "9router"),
-        "/usr/local/bin/9router",
-        "9router",
-    ]
-    started = False
-    for cand in cli_candidates:
-        try:
-            subprocess.Popen([cand, "--skip-update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            started = True
-            print(f"[OK] Launched 9router process via: {cand}")
-            break
-        except Exception:
-            continue
+    binary = find_9router_binary()
+    if not binary:
+        print("9router binary not found; installing from npm...")
+        if not install_9router():
+            print("[FAIL] Could not install 9router. Install manually: npm i -g 9router@latest")
+            return
+        binary = find_9router_binary()
 
-    if not started:
+    restore_9router_db()
+
+    if not binary:
         print("[FAIL] Could not launch 9router binary. Start it manually via: 9router")
-    else:
-        print("Waiting 2 seconds for socket...")
-        time.sleep(2.0)
+        return
+
+    try:
+        subprocess.Popen([binary, "--skip-update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        print(f"[FAIL] Could not launch 9router ({binary}): {exc}")
+        return
+
+    print(f"[OK] Launched 9router process via: {binary}")
+    print("Waiting 2 seconds for socket...")
+    time.sleep(2.0)
+
+
+# ============================================================================
+# 9router Installation, Update, and Database Restore
+# ============================================================================
+
+_9ROUTER_NPM_PACKAGE = "9router@latest"
+_BUNDLED_DB_BACKUP_DIR = os.path.join(_HERE, "9router", "db")
+
+
+def find_9router_binary() -> str | None:
+    """Locates the installed 9router CLI, or None if it is not installed."""
+    found = shutil.which("9router")
+    if found:
+        return found
+    home = os.path.expanduser("~")
+    for cand in (
+        os.path.join(home, ".npm-global", "bin", "9router"),
+        os.path.join(home, ".bun", "bin", "9router"),
+        "/usr/local/bin/9router",
+        "/opt/homebrew/bin/9router",
+    ):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def install_9router(*, update: bool = False) -> bool:
+    """Installs or updates 9router globally via npm. Returns True on success."""
+    npm = shutil.which("npm")
+    if not npm:
+        print("[FAIL] npm not found in PATH; install Node.js first (https://nodejs.org)")
+        return False
+
+    action = "Updating" if update else "Installing"
+    print(f"{action} {_9ROUTER_NPM_PACKAGE} (npm i -g {_9ROUTER_NPM_PACKAGE} --prefer-online)...")
+    try:
+        result = subprocess.run(
+            [npm, "i", "-g", _9ROUTER_NPM_PACKAGE, "--prefer-online"],
+            check=False,
+        )
+    except Exception as exc:
+        print(f"[FAIL] npm install failed: {exc}")
+        return False
+
+    if result.returncode != 0:
+        print(f"[FAIL] npm exited with code {result.returncode}")
+        return False
+
+    binary = find_9router_binary()
+    print(f"[OK] 9router {'updated' if update else 'installed'}: {binary or '(binary not on PATH yet)'}")
+    return True
+
+
+def latest_bundled_db_backup() -> str | None:
+    """Newest 9router DB backup shipped in the repo's 9router/db directory."""
+    try:
+        backups = [
+            os.path.join(_BUNDLED_DB_BACKUP_DIR, name)
+            for name in os.listdir(_BUNDLED_DB_BACKUP_DIR)
+            if name.endswith(".json")
+        ]
+    except OSError:
+        return None
+    if not backups:
+        return None
+    return max(backups, key=os.path.getmtime)
+
+
+def restore_9router_db(*, force: bool = False) -> bool:
+    """Restores ~/.9router/db.json from the bundled backup.
+
+    Only restores when the live DB is missing, unless force=True (then the
+    existing DB is copied aside to db.json.bak first). Returns True if restored.
+    """
+    backup = latest_bundled_db_backup()
+    if not backup:
+        if force:
+            print(f"[FAIL] No bundled DB backup found in {_BUNDLED_DB_BACKUP_DIR}")
+        return False
+
+    nine_dir = os.path.join(os.path.expanduser("~"), ".9router")
+    db_file = os.path.join(nine_dir, "db.json")
+
+    if os.path.isfile(db_file) and not force:
+        return False
+
+    try:
+        with open(backup, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict) or "settings" not in payload:
+            print(f"[FAIL] Backup does not look like a 9router DB: {backup}")
+            return False
+
+        os.makedirs(nine_dir, exist_ok=True)
+        if os.path.isfile(db_file):
+            shutil.copy2(db_file, db_file + ".bak")
+            print(f"[OK] Existing DB saved to {db_file}.bak")
+        shutil.copy2(backup, db_file)
+    except Exception as exc:
+        print(f"[FAIL] Could not restore 9router DB: {exc}")
+        return False
+
+    print(f"[OK] Restored 9router DB from {os.path.basename(backup)} -> {db_file}")
+    return True
+
+
+def ensure_9router_installed() -> bool:
+    """Installs 9router when the system cannot detect it, and seeds its DB."""
+    binary = find_9router_binary()
+    if binary and _LOCAL_9ROUTER.installed:
+        return True
+
+    if not binary:
+        print("9router not detected on this system.")
+        if not install_9router():
+            return False
+
+    restore_9router_db()
+    return find_9router_binary() is not None
 
 
 def _ping_tunnel(tunnel_url: str) -> bool:
@@ -2346,6 +2474,9 @@ def main() -> None:
             "--stats",
             "--usage",
             "--start-9router",
+            "--install-9router",
+            "--update-9router",
+            "--restore-9router-db",
             "--help",
             "-h",
         }:
@@ -2361,11 +2492,25 @@ def main() -> None:
         print("  --models                    List all models discovered from 9router")
         print("  --combos                    List 9router combos and fallback groups")
         print("  --stats, --usage            Show 9router token savings and provider status")
-        print("  --start-9router             Start 9router background process")
+        print("  --start-9router             Start 9router (installs it via npm if missing)")
+        print("  --install-9router           Install 9router globally (npm i -g 9router@latest)")
+        print("  --update-9router            Update 9router to the latest npm release")
+        print("  --restore-9router-db        Restore ~/.9router/db.json from the bundled backup")
         print("  --print-env                 Show resolved config")
         print("  --proxy-only                Run only the local proxy in foreground")
         print("  --help, -h                  Show this help")
         return
+
+    if "--install-9router" in launcher_args:
+        ok = install_9router()
+        restore_9router_db()
+        sys.exit(0 if ok else 1)
+
+    if "--update-9router" in launcher_args:
+        sys.exit(0 if install_9router(update=True) else 1)
+
+    if "--restore-9router-db" in launcher_args:
+        sys.exit(0 if restore_9router_db(force=True) else 1)
 
     load_config()
     port = PORT or find_free_port()
