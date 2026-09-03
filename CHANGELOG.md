@@ -24,7 +24,8 @@ and the project uses [Semantic Versioning](https://semver.org/).
   `suggested_prefix/suffix_char_count` is derived from its real window.
 - Requests honour the model Auggie asks for when it is one the launcher advertises,
   and cap `max_tokens`/`max_completion_tokens` to the model's budget.
-- `main.py` renamed to `auggie_launch.py` (importable, installable module).
+- `main.py` split into the `auggie_launch` package (config, truncation, transform,
+  upstream, models, registry, proxy, injections, ninerouter, cli).
 - Single source of truth for the version (`auggie_launch.__version__`).
 
 ### Fixed

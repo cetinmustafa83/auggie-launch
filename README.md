@@ -283,6 +283,21 @@ upstream credits. Pin it with `AUGGIE_LAUNCH_LOCAL_TOKEN`, or disable the check 
 
 ## Development
 
+The launcher is a package with one module per concern:
+
+| Module | Responsibility |
+|---|---|
+| `auggie_launch/config.py` | Shared runtime state, `.env` loading, `load_config()` |
+| `auggie_launch/truncation.py` | Token estimation, turn-atomic truncation, tool-call merging |
+| `auggie_launch/transform.py` | Augment ↔ OpenAI message/tool transformation |
+| `auggie_launch/upstream.py` | Connection pool, retries, throttling, tunnel failover |
+| `auggie_launch/models.py` | Catalog lookups, per-model context windows, model routing |
+| `auggie_launch/registry.py` | Model registry and session payloads served to Auggie |
+| `auggie_launch/proxy.py` | The local Augment-compatible HTTP server |
+| `auggie_launch/injections.py` | Environment, feature-flag, and MCP injections |
+| `auggie_launch/ninerouter.py` | 9router diagnostics, install/update, DB restore |
+| `auggie_launch/cli.py` | Argument handling and process launch |
+
 ```bash
 python3 -m unittest -v test_modern_proxy   # offline test suite
 python3 -m ruff check .                    # lint

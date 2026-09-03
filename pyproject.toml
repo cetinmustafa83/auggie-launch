@@ -19,13 +19,13 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-auggie-launch = "auggie_launch:main"
+auggie-launch = "auggie_launch.cli:main"
 
 [tool.setuptools]
-py-modules = ["auggie_launch"]
+packages = ["auggie_launch"]
 
 [tool.setuptools.dynamic]
-version = { attr = "auggie_launch.__version__" }
+version = { attr = "auggie_launch.config.__version__" }
 
 [tool.ruff]
 line-length = 120
@@ -41,7 +41,7 @@ ignore = [
 
 [tool.mypy]
 python_version = "3.10"
-files = ["auggie_launch.py"]
+files = ["auggie_launch"]
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true

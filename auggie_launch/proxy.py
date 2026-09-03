@@ -1,0 +1,394 @@
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler
+from typing import Any
+
+from . import config
+from .config import log
+from .models import effective_context_limit
+from .registry import fake_batch_upload, fake_find_missing, fake_generic, fake_models, fake_token
+from .transform import build_openai_request, text_from_value
+from .truncation import tool_calls_to_nodes
+from .upstream import compact_upstream_error, json_bytes, open_upstream_with_retries
+
+# ============================================================================
+# Local Auggie Proxy Server
+# ============================================================================
+
+def read_json(handler: BaseHTTPRequestHandler) -> Any:
+    length = int(handler.headers.get("content-length") or "0")
+    if length <= 0:
+        return {}
+    raw = handler.rfile.read(length)
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {"_raw": raw.decode("utf-8", errors="replace")}
+
+
+def extract_chat_text(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict):
+                content = text_from_value(message.get("content"))
+                reasoning = text_from_value(message.get("reasoning_content") or message.get("reasoning") or message.get("thought"))
+                if reasoning and config.STREAM_THINKING and not content.startswith("<think>"):
+                    return f"<think>\n{reasoning}\n</think>\n\n{content}"
+                return content
+            return text_from_value(first.get("text"))
+    return text_from_value(data.get("text") or data.get("content"))
+
+
+def estimate_usage(request: dict[str, Any], usage: Any) -> dict[str, int]:
+    if isinstance(usage, dict):
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        total = int(usage.get("total_tokens") or prompt + completion)
+        return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    chars = len(json.dumps(request.get("messages", []), ensure_ascii=False))
+    prompt = max(1, chars // 4)
+    return {"prompt_tokens": prompt, "completion_tokens": 0, "total_tokens": prompt}
+
+
+def augment_usage(openai_request: dict[str, Any], usage: Any) -> dict[str, int]:
+    basic = estimate_usage(openai_request, usage)
+    request_model = openai_request.get("model") if isinstance(openai_request, dict) else None
+    context_tokens = effective_context_limit(request_model) if isinstance(request_model, str) else config.MODEL_CONTEXT_TOKENS
+    return {
+        "input_tokens": basic["prompt_tokens"],
+        "output_tokens": basic["completion_tokens"],
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "system_prompt_tokens": 0,
+        "chat_history_tokens": 0,
+        "current_message_tokens": basic["prompt_tokens"],
+        "tool_definitions_tokens": 0,
+        "tool_result_tokens": 0,
+        "assistant_response_tokens": basic["completion_tokens"],
+        "max_context_tokens": context_tokens or config.MODEL_CONTEXT_TOKENS,
+        "max_output_tokens": config.MODEL_MAX_OUTPUT_TOKENS,
+    }
+
+
+def augment_chat_response(text: str, request_id: str, openai_request: dict[str, Any], usage: Any, tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    token_usage = augment_usage(openai_request, usage)
+    basic_usage = estimate_usage(openai_request, usage)
+    nodes: list[dict[str, Any]] = []
+    if text:
+        nodes.append({"id": 1, "type": 0, "content": text})
+    nodes.extend(tool_calls_to_nodes(tool_calls or [], starting_id=len(nodes) + 1))
+    nodes.append({"id": 10000, "type": 10, "token_usage": token_usage})
+    stop_reason = "tool_use" if any(node.get("type") == 5 for node in nodes) else "stop"
+    return {
+        "text": text,
+        "response_text": text,
+        "completion": text,
+        "request_id": request_id,
+        "requestId": request_id,
+        "stop_reason": stop_reason,
+        "token_usage": token_usage,
+        "total_tokens": basic_usage["total_tokens"],
+        "usage": basic_usage,
+        "nodes": nodes,
+    }
+
+
+class AuggieProxy(BaseHTTPRequestHandler):
+    server_version = f"auggie-launch/{config.__version__} (9router-native)"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        if config.VERBOSE:
+            super().log_message(fmt, *args)
+
+    def send_json(self, value: Any, status: int = 200) -> None:
+        data = json_bytes(value)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def send_text(self, value: str, status: int = 200) -> None:
+        data = value.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def normalized_path(self) -> str:
+        parsed = urllib.parse.urlparse(self.path)
+        return parsed.path.strip("/")
+
+    def authorized(self, path: str) -> bool:
+        """Rejects anything that does not carry the token injected into Auggie.
+
+        The proxy binds to loopback only, but any local process could otherwise
+        drive it (and spend upstream credits), so the token is checked on every
+        request except the unauthenticated health and token endpoints.
+        """
+        if not config.REQUIRE_LOCAL_TOKEN:
+            return True
+        if path in {"", "health"} or path in {"token", "auth/token"} or path.endswith("/token"):
+            return True
+        header = self.headers.get("Authorization") or self.headers.get("authorization") or ""
+        presented = header[7:].strip() if header.lower().startswith("bearer ") else header.strip()
+        if not presented:
+            presented = (self.headers.get("X-Api-Key") or "").strip()
+        if presented and secrets.compare_digest(presented, config.LOCAL_TOKEN):
+            return True
+        log(f"rejected unauthorized local request to /{path}")
+        self.send_json({"error": {"message": "unauthorized: missing or invalid local token"}}, status=401)
+        return False
+
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        path = self.normalized_path()
+        if not self.authorized(path):
+            return
+        if path in {"", "health"}:
+            self.send_json({
+                "ok": True,
+                "service": "auggie-launch",
+                "version": config.__version__,
+                "router": "9router-native" if config.IS_9ROUTER else "standard",
+                "model": config.TARGET_MODEL,
+                "indexing_mode": config.INDEXING_MODE,
+                "9router_combos": [c.get("name") for c in config._LOCAL_9ROUTER.combos],
+                "caveman": config.ROUTER_CAVEMAN_MODE,
+            })
+        elif path in {"get-models", "models", "model-config"}:
+            self.send_json(fake_models())
+        else:
+            self.send_json(fake_generic(path))
+
+    def do_POST(self) -> None:
+        path = self.normalized_path()
+        if not self.authorized(path):
+            return
+        body = read_json(self)
+        if config.VERBOSE:
+            log(f"{self.command} /{path}")
+
+        if path in {"token", "auth/token"} or path.endswith("/token"):
+            self.send_json(fake_token())
+            return
+        if path in {"get-models", "models", "model-config"}:
+            self.send_json(fake_models())
+            return
+        if path == "find-missing":
+            self.send_json(fake_find_missing(body))
+            return
+        if path == "batch-upload":
+            self.send_json(fake_batch_upload(body))
+            return
+        if path in {"chat-stream", "prompt-enhancer"}:
+            self.forward_stream(body)
+            return
+        if path in {"chat", "remote-agents/chat"}:
+            self.forward_json(body)
+            return
+        if path in {"completion", "completion/request", "completion/complete", "chat-input-completion"}:
+            self.forward_json(body)
+            return
+        if path in {"completion/resolve", "completion/cancel", "resolve-completions"}:
+            self.send_json({"ok": True})
+            return
+        self.send_json(fake_generic(path))
+
+    def forward_json(self, body: Any) -> None:
+        openai_request = build_openai_request(body, stream=False)
+        if config.VERBOSE:
+            os.makedirs(config.DEBUG_DIR, exist_ok=True)
+            with open(os.path.join(config.DEBUG_DIR, "incoming_augment_request.json"), "w", encoding="utf-8") as f:
+                json.dump(body, f, ensure_ascii=False, indent=2)
+            with open(os.path.join(config.DEBUG_DIR, "outgoing_openai_request.json"), "w", encoding="utf-8") as f:
+                json.dump(openai_request, f, ensure_ascii=False, indent=2)
+        try:
+            with open_upstream_with_retries(json_bytes(openai_request), stream=False, timeout=300, label="json") as resp:
+                raw = resp.read()
+            data = json.loads(raw.decode("utf-8") or "{}")
+            text = extract_chat_text(data)
+            tool_calls: list[dict[str, Any]] = []
+            choices = data.get("choices") if isinstance(data, dict) else None
+            if isinstance(choices, list) and choices:
+                message = choices[0].get("message") if isinstance(choices[0], dict) else None
+                if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
+                    tool_calls = [call for call in message["tool_calls"] if isinstance(call, dict)]
+            self.send_json(augment_chat_response(text, str(uuid.uuid4()), openai_request, data.get("usage") if isinstance(data, dict) else None, tool_calls))
+        except urllib.error.HTTPError as exc:
+            raw = compact_upstream_error(exc.msg, max_chars=2000)
+            self.send_json({"error": "upstream_error", "message": raw, "status": exc.code}, status=502 if exc.code in {401, 403} else exc.code)
+        except Exception as exc:
+            self.send_json({"error": "upstream_error", "message": compact_upstream_error(str(exc))}, status=502)
+
+    def forward_stream(self, body: Any) -> None:
+        openai_request = build_openai_request(body, stream=True)
+        if config.VERBOSE:
+            os.makedirs(config.DEBUG_DIR, exist_ok=True)
+            with open(os.path.join(config.DEBUG_DIR, "incoming_augment_request.json"), "w", encoding="utf-8") as f:
+                json.dump(body, f, ensure_ascii=False, indent=2)
+            with open(os.path.join(config.DEBUG_DIR, "outgoing_openai_request.json"), "w", encoding="utf-8") as f:
+                json.dump(openai_request, f, ensure_ascii=False, indent=2)
+        request_id = str(uuid.uuid4())
+        try:
+            upstream_wrapper = open_upstream_with_retries(json_bytes(openai_request), stream=True, timeout=300, label="stream")
+        except urllib.error.HTTPError as exc:
+            msg = compact_upstream_error(exc.msg, max_chars=2000)
+            self.send_json({"error": "upstream_error", "message": msg, "status": exc.code, "request_id": request_id}, status=502 if exc.code in {401, 403} else exc.code)
+            return
+        except Exception as exc:
+            self.send_json({"error": "upstream_error", "message": compact_upstream_error(str(exc)), "request_id": request_id}, status=502)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        accumulated: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        usage: Any = None
+        client_disconnected = False
+        in_thinking_block = False
+
+        def write_chunk(value: dict[str, Any]) -> bool:
+            nonlocal client_disconnected
+            if client_disconnected:
+                return False
+            payload = json_bytes(value) + b"\n"
+            try:
+                self.wfile.write(f"{len(payload):X}\r\n".encode("ascii"))
+                self.wfile.write(payload)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                client_disconnected = True
+                log("client disconnected mid-stream; stopping upstream stream")
+                return False
+
+        try:
+            with upstream_wrapper as resp:
+                write_chunk({"text": "", "heartbeat": True, "request_id": request_id})
+                last_heartbeat = time.time()
+
+                for raw_line in resp:
+                    if client_disconnected:
+                        break
+
+                    now = time.time()
+                    if now - last_heartbeat > 5.0:
+                        write_chunk({"text": "", "heartbeat": True, "request_id": request_id})
+                        last_heartbeat = now
+
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if not payload:
+                        continue
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(payload)
+                    except Exception:
+                        continue
+                    if isinstance(data, dict) and data.get("usage"):
+                        usage = data.get("usage")
+                    choices = data.get("choices") if isinstance(data, dict) else None
+                    delta_text = ""
+                    reasoning_text = ""
+
+                    if isinstance(choices, list) and choices:
+                        first = choices[0]
+                        if isinstance(first, dict):
+                            delta = first.get("delta")
+                            if isinstance(delta, dict):
+                                delta_text = text_from_value(delta.get("content"))
+                                reasoning_text = text_from_value(
+                                    delta.get("reasoning_content")
+                                    or delta.get("reasoning")
+                                    or delta.get("thought")
+                                )
+                                raw_tool_calls = delta.get("tool_calls")
+                                if isinstance(raw_tool_calls, list):
+                                    tool_calls.extend(call for call in raw_tool_calls if isinstance(call, dict))
+                            else:
+                                delta_text = text_from_value(first.get("text"))
+
+                    # Reasoning / thinking stream:
+                    if reasoning_text:
+                        if config.STREAM_THINKING:
+                            if not in_thinking_block:
+                                in_thinking_block = True
+                                write_chunk({"text": "<think>\n", "delta": "<think>\n", "request_id": request_id})
+                                accumulated.append("<think>\n")
+                            accumulated.append(reasoning_text)
+                            write_chunk({"text": reasoning_text, "delta": reasoning_text, "request_id": request_id})
+                        else:
+                            write_chunk({"text": "", "heartbeat": True, "thinking": True, "request_id": request_id})
+
+                    if delta_text:
+                        if in_thinking_block:
+                            in_thinking_block = False
+                            write_chunk({"text": "\n</think>\n\n", "delta": "\n</think>\n\n", "request_id": request_id})
+                            accumulated.append("\n</think>\n\n")
+
+                        accumulated.append(delta_text)
+                        write_chunk({"text": delta_text, "delta": delta_text, "request_id": request_id})
+
+        except Exception as exc:
+            if not client_disconnected:
+                write_chunk({"error": "upstream_error", "message": compact_upstream_error(str(exc)), "request_id": request_id})
+        finally:
+            if in_thinking_block and not client_disconnected:
+                write_chunk({"text": "\n</think>\n\n", "delta": "\n</think>\n\n", "request_id": request_id})
+                accumulated.append("\n</think>\n\n")
+
+            if not client_disconnected:
+                final_text = "".join(accumulated)
+                final = augment_chat_response(final_text, request_id, openai_request, usage, tool_calls)
+                final["done"] = True
+                write_chunk(final)
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+

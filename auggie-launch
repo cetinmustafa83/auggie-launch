@@ -9,4 +9,4 @@ while [[ -L "$SCRIPT_PATH" ]]; do
 done
 ROOT="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
-exec python3 "$ROOT/auggie_launch.py" "$@"
+exec env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m auggie_launch "$@"

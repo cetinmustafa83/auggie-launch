@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 auggie-launch contributors
+# For learning and research only; any other use is at your own risk.
+"""auggie-launch: local Python proxy and launcher for Auggie/Augment Code CLI.
+
+Deeply integrates with 9router (reading ~/.9router local database, combos, aliases,
+catalog, tunnel, and provider keys), provides full injections into Auggie CLI
+(session auth, environment, MCP tools, Caveman ultra instructions, feature flags),
+and forwards chat/completion requests to OpenAI/Claude-compatible upstream endpoints.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import subprocess
+import sys
+import tempfile
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+_REQUIRED_KEYS = (
+    "AUGGIE_LAUNCH_BASE_URL",
+    "AUGGIE_LAUNCH_MODEL",
+)
+_MANAGED_ENV_PREFIXES = ("AUGGIE_LAUNCH_",)
+_MANAGED_ENV_KEYS = {"AUGGIE_BIN"}
+
+__version__ = "0.4.0"
+
+# --- Global Configurations ---
+TARGET_BASE_URL = ""
+# Runtime upstream override: set when the local 9router socket dies and the
+# Cloudflare tunnel takes over. Sticky for the process lifetime.
+# lc-debt: no automatic switch back to local once the tunnel takes over; restart to reset.
+ACTIVE_BASE_URL = ""
+TUNNEL_BASE_URL = ""
+BASE_URL_LOCK = threading.Lock()
+TARGET_MODEL = ""
+TARGET_API_KEY = ""
+API_KEYS: list[str] = []
+FROZEN_KEYS: dict[str, float] = {}
+FROZEN_LOCK = threading.Lock()
+AUGGIE_BIN = "auggie"
+LOCAL_TOKEN = "fake-augment-access-token"
+VERBOSE = False
+DEBUG_DIR = ""
+PORT = 0
+
+UPSTREAM_USER_AGENT = "codex-cli"
+UPSTREAM_APP_NAME = "Codex"
+UPSTREAM_MIN_INTERVAL_SECONDS = 0.25
+UPSTREAM_RETRIES = 2
+UPSTREAM_429_FREEZE_SECONDS = 60.0
+UPSTREAM_5XX_FREEZE_SECONDS = 30.0
+UPSTREAM_MAX_RETRY_AFTER_SECONDS = 300.0
+UPSTREAM_BACKOFF_INITIAL_SECONDS = 1.0
+UPSTREAM_BACKOFF_MAX_SECONDS = 30.0
+UPSTREAM_NEXT_REQUEST_AT = 0.0
+UPSTREAM_COOLDOWN_UNTIL = 0.0
+UPSTREAM_THROTTLE_LOCK = threading.Lock()
+
+SANITIZE_UPSTREAM_PROMPTS = False
+INDEXING_MODE = "complete"
+MODEL_CONTEXT_TOKENS = 200000
+MODEL_CONTEXT_TOKENS_EXPLICIT = False
+MODEL_MAX_OUTPUT_TOKENS = 16000
+REQUIRE_LOCAL_TOKEN = True
+REASONING_EFFORT = ""
+STREAM_THINKING = True
+
+# --- 9router & Modern LLM Specific Features ---
+IS_9ROUTER = False
+ROUTER_CAVEMAN_MODE = False
+ROUTER_CAVEMAN_LEVEL = "ultra"
+ROUTER_PROVIDER = ""
+CACHED_CATALOG: dict[str, Any] = {}
+DYNAMIC_MODELS = True
+USE_COMPLETION_TOKENS = "auto"  # auto | true | false
+ENABLE_CONNECTION_POOL = True
+AUTO_INJECT_MCP = True
+
+_LOADED_ENV_FILES: list[str] = []
+_CODEX_SESSION_ID = f"session-{uuid.uuid4()}"
+_CODEX_THREAD_ID = str(uuid.uuid4())
+_CODEX_INSTALLATION_ID = str(uuid.uuid4())
+
+# Cached dynamic model registry from 9router/upstream
+_CACHED_MODELS: list[dict[str, Any]] = []
+_CACHED_MODELS_TIME = 0.0
+_MODELS_CACHE_TTL = 60.0
+_MODELS_LOCK = threading.Lock()
+
+
+# ============================================================================
+# Deep 9router Local State & Discovery Engine
+# ============================================================================
+
+@dataclass
+class NineRouterLocalState:
+    installed: bool = False
+    db_path: str = ""
+    settings: dict[str, Any] = field(default_factory=dict)
+    combos: list[dict[str, Any]] = field(default_factory=list)
+    model_aliases: dict[str, str] = field(default_factory=dict)
+    api_keys: list[str] = field(default_factory=list)
+    provider_connections: list[dict[str, Any]] = field(default_factory=list)
+    provider_api_keys: dict[str, str] = field(default_factory=dict)
+    tunnel_url: str = ""
+    caveman_enabled: bool = False
+    caveman_level: str = "ultra"
+    catalog_models: dict[str, Any] = field(default_factory=dict)
+
+
+def read_local_9router_state() -> NineRouterLocalState:
+    """Reads ~/.9router/db.json and model-catalog.json to treat 9router as part of ourselves."""
+    state = NineRouterLocalState()
+    home = os.path.expanduser("~")
+    nine_dir = os.path.join(home, ".9router")
+    db_file = os.path.join(nine_dir, "db.json")
+    catalog_file = os.path.join(nine_dir, "model-catalog.json")
+
+    if not os.path.isdir(nine_dir) or not os.path.isfile(db_file):
+        return state
+
+    state.installed = True
+    state.db_path = db_file
+
+    try:
+        with open(db_file, encoding="utf-8") as f:
+            data = json.load(f)
+
+        state.settings = data.get("settings") or {}
+        state.combos = data.get("combos") or []
+        state.model_aliases = data.get("modelAliases") or {}
+        state.tunnel_url = (state.settings.get("tunnelUrl") or "").strip()
+        state.caveman_enabled = bool(state.settings.get("cavemanEnabled", False))
+        state.caveman_level = str(state.settings.get("cavemanLevel") or "ultra").strip()
+
+        # Extract active API keys
+        raw_keys = data.get("apiKeys") or []
+        for k in raw_keys:
+            if isinstance(k, dict) and k.get("key") and k.get("isActive", True):
+                state.api_keys.append(str(k["key"]).strip())
+
+        # Extract provider connections and API keys
+        raw_providers = data.get("providerConnections") or []
+        state.provider_connections = raw_providers
+        for p in raw_providers:
+            if not isinstance(p, dict) or not p.get("isActive", True):
+                continue
+            prov_name = str(p.get("provider") or "").lower()
+            key_val = p.get("apiKey") or p.get("accessToken")
+            if prov_name and key_val:
+                state.provider_api_keys[prov_name] = str(key_val).strip()
+
+    except Exception as exc:
+        log(f"error reading local 9router db: {exc}")
+
+    # Read model catalog for capabilities (vision, audio, pdf)
+    if os.path.isfile(catalog_file):
+        try:
+            with open(catalog_file, encoding="utf-8") as f:
+                cat_data = json.load(f)
+                state.catalog_models = cat_data.get("models") or {}
+        except Exception as exc:
+            log(f"error reading local 9router catalog: {exc}")
+
+    return state
+
+
+_LOCAL_9ROUTER = read_local_9router_state()
+
+
+# ============================================================================
+# Environment & Configuration Loading
+# ============================================================================
+
+def _parse_dotenv(path: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                out[key] = value
+    except OSError:
+        pass
+    return out
+
+
+def _candidate_env_paths() -> list[str]:
+    paths: list[str] = []
+    explicit = os.environ.get("AUGGIE_LAUNCH_ENV")
+    if explicit:
+        paths.append(os.path.expanduser(explicit))
+
+    cwd = os.getcwd()
+    paths.append(os.path.join(cwd, ".env"))
+    paths.append(os.path.join(cwd, ".auggie-launch.env"))
+
+    parent = os.path.dirname(cwd)
+    for _ in range(6):
+        if not parent or parent == os.path.dirname(parent):
+            break
+        paths.append(os.path.join(parent, ".env"))
+        paths.append(os.path.join(parent, ".auggie-launch.env"))
+        parent = os.path.dirname(parent)
+
+    paths.append(os.path.join(_HERE, ".env"))
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    paths.append(os.path.join(xdg, "auggie-launch", ".env"))
+    paths.append(os.path.expanduser("~/.auggie-launch.env"))
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in paths:
+        ap = os.path.abspath(path)
+        if ap not in seen:
+            seen.add(ap)
+            unique.append(ap)
+    return unique
+
+
+def _is_managed_env_key(key: str) -> bool:
+    return key in _MANAGED_ENV_KEYS or key.startswith(_MANAGED_ENV_PREFIXES)
+
+
+def load_dotenv_files() -> list[str]:
+    loaded: list[str] = []
+    claimed = {key for key in os.environ.keys() if not _is_managed_env_key(key)}
+    for path in _candidate_env_paths():
+        if not os.path.isfile(path):
+            continue
+        data = _parse_dotenv(path)
+        if not data:
+            continue
+        for key, value in data.items():
+            if key in claimed:
+                continue
+            os.environ[key] = value
+            claimed.add(key)
+        loaded.append(path)
+    return loaded
+
+
+def env_truthy(name: str, fallback: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return fallback
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def bounded_float(value: str | None, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        parsed = float(value) if value is not None and value.strip() else default
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def bounded_int(value: str | None, default: int, *, minimum: int = 0) -> int:
+    try:
+        parsed = int(value) if value is not None and value.strip() else default
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def env_int(name: str, fallback: int) -> int:
+    try:
+        value = int((os.environ.get(name) or "").strip())
+        return value if value > 0 else fallback
+    except ValueError:
+        return fallback
+
+
+def codex_version() -> str:
+    configured = (os.environ.get("CODEX_VERSION") or "").strip()
+    if configured:
+        return configured
+    codex_bin = (os.environ.get("CODEX_BIN") or "codex").strip() or "codex"
+    try:
+        result = subprocess.run(
+            [codex_bin, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return "0.144.6"
+    for token in result.stdout.replace("v", " v").split():
+        candidate = token.lstrip("v")
+        parts = candidate.split(".")
+        if len(parts) >= 2 and all(part.isdigit() for part in parts[:2]):
+            return candidate
+    return "0.144.6"
+
+
+def codex_user_agent() -> str:
+    originator = (os.environ.get("CODEX_ORIGINATOR") or "codex_cli_rs").strip() or "codex_cli_rs"
+    version = codex_version()
+    system = platform.system() or "Unknown"
+    release = platform.release() or "unknown"
+    arch = platform.machine() or "unknown"
+    return f"{originator}/{version} ({system} {release}; {arch})"
+
+
+def default_upstream_user_agent(fallback: str) -> str:
+    if env_truthy("CODEX_HEAD"):
+        return (os.environ.get("CODEX_USER_AGENT") or codex_user_agent()).strip()
+    return fallback
+
+
+def with_codex_headers(headers: dict[str, str]) -> dict[str, str]:
+    if not env_truthy("CODEX_HEAD"):
+        return headers
+
+    out = dict(headers)
+    out["User-Agent"] = out.get("User-Agent") or codex_user_agent()
+    out.setdefault("Originator", (os.environ.get("CODEX_ORIGINATOR") or "codex_cli_rs").strip() or "codex_cli_rs")
+    out.setdefault("session-id", (os.environ.get("CODEX_SESSION_ID") or _CODEX_SESSION_ID).strip())
+    out.setdefault("thread-id", (os.environ.get("CODEX_THREAD_ID") or _CODEX_THREAD_ID).strip())
+    out.setdefault("x-codex-installation-id", (os.environ.get("CODEX_INSTALLATION_ID") or _CODEX_INSTALLATION_ID).strip())
+    beta = (os.environ.get("CODEX_OPENAI_BETA") or "").strip()
+    if beta:
+        out.setdefault("OpenAI-Beta", beta)
+    return out
+
+
+def detect_9router(url: str) -> bool:
+    """Checks whether the upstream URL is likely 9router."""
+    if env_truthy("AUGGIE_LAUNCH_FORCE_9ROUTER", False):
+        return True
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.port == 20128:
+            return True
+        if "9router" in parsed.netloc.lower() or "9router" in parsed.path.lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def load_config() -> None:
+    global TARGET_BASE_URL, TARGET_MODEL, TARGET_API_KEY, API_KEYS, AUGGIE_BIN
+    global LOCAL_TOKEN, VERBOSE, DEBUG_DIR, PORT, _LOADED_ENV_FILES
+    global UPSTREAM_USER_AGENT, UPSTREAM_APP_NAME, SANITIZE_UPSTREAM_PROMPTS
+    global UPSTREAM_MIN_INTERVAL_SECONDS, UPSTREAM_RETRIES
+    global UPSTREAM_429_FREEZE_SECONDS, UPSTREAM_5XX_FREEZE_SECONDS
+    global UPSTREAM_MAX_RETRY_AFTER_SECONDS, UPSTREAM_BACKOFF_INITIAL_SECONDS
+    global UPSTREAM_BACKOFF_MAX_SECONDS
+    global INDEXING_MODE, MODEL_CONTEXT_TOKENS, MODEL_MAX_OUTPUT_TOKENS, REASONING_EFFORT
+    global MODEL_CONTEXT_TOKENS_EXPLICIT, REQUIRE_LOCAL_TOKEN
+    global STREAM_THINKING, IS_9ROUTER, ROUTER_CAVEMAN_MODE, ROUTER_CAVEMAN_LEVEL
+    global ROUTER_PROVIDER, DYNAMIC_MODELS, USE_COMPLETION_TOKENS, ENABLE_CONNECTION_POOL
+    global CACHED_CATALOG, _LOCAL_9ROUTER, AUTO_INJECT_MCP
+
+    _LOADED_ENV_FILES = load_dotenv_files()
+    _LOCAL_9ROUTER = read_local_9router_state()
+
+    # Read model catalog for capabilities (vision, audio, pdf, context window)
+    home = os.path.expanduser("~")
+    catalog_file = os.path.join(home, ".9router", "model-catalog.json")
+    if os.path.isfile(catalog_file):
+        try:
+            with open(catalog_file, encoding="utf-8") as f:
+                cat_data = json.load(f)
+                global CACHED_CATALOG
+                CACHED_CATALOG = cat_data.get("models", {})
+        except Exception as exc:
+            log(f"error reading local 9router catalog: {exc}")
+
+    # Zero-config auto-detection from 9router local DB if available
+    base_url_env = os.environ.get("AUGGIE_LAUNCH_BASE_URL", "").strip()
+    if not base_url_env:
+        base_url_env = "http://localhost:20128/v1"
+        os.environ["AUGGIE_LAUNCH_BASE_URL"] = base_url_env
+
+    model_env = os.environ.get("AUGGIE_LAUNCH_MODEL", "").strip()
+    if not model_env:
+        model_env = _LOCAL_9ROUTER.combos[0]["name"] if _LOCAL_9ROUTER.combos else "free"
+        os.environ["AUGGIE_LAUNCH_MODEL"] = model_env
+
+    key_text = os.environ.get("AUGGIE_LAUNCH_API_KEYS") or os.environ.get("AUGGIE_LAUNCH_API_KEY") or ""
+    if not key_text and _LOCAL_9ROUTER.api_keys:
+        key_text = _LOCAL_9ROUTER.api_keys[0]
+        os.environ["AUGGIE_LAUNCH_API_KEY"] = key_text
+
+    API_KEYS = [key.strip() for key in key_text.split(",") if key.strip()]
+
+    missing = [key for key in _REQUIRED_KEYS if not (os.environ.get(key) or "").strip()]
+    if not API_KEYS:
+        missing.append("AUGGIE_LAUNCH_API_KEY (or 9router active key)")
+    if missing:
+        xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        print("error: missing required configuration: " + ", ".join(missing), file=sys.stderr)
+        print(f"Set them in ./.env or {os.path.join(xdg, 'auggie-launch', '.env')}", file=sys.stderr)
+        print(f"template: {os.path.join(_HERE, '.env.example')}", file=sys.stderr)
+        sys.exit(2)
+
+    TARGET_BASE_URL = os.environ["AUGGIE_LAUNCH_BASE_URL"].strip().rstrip("/")
+    TARGET_MODEL = os.environ["AUGGIE_LAUNCH_MODEL"].strip()
+    TARGET_API_KEY = API_KEYS[0]
+    AUGGIE_BIN = (os.environ.get("AUGGIE_BIN") or "auggie").strip()
+    # Per-session random token unless pinned: the proxy is loopback-only but still
+    # refuses requests that do not carry the token it injected into Auggie.
+    LOCAL_TOKEN = (os.environ.get("AUGGIE_LAUNCH_LOCAL_TOKEN") or f"al-{uuid.uuid4().hex}").strip()
+    VERBOSE = env_truthy("AUGGIE_LAUNCH_VERBOSE")
+    DEBUG_DIR = (os.environ.get("AUGGIE_LAUNCH_DEBUG_DIR") or os.path.join(tempfile.gettempdir(), "auggie-launch")).strip()
+    PORT = env_int("AUGGIE_LAUNCH_PORT", 0)
+
+    UPSTREAM_USER_AGENT = (os.environ.get("AUGGIE_LAUNCH_USER_AGENT") or default_upstream_user_agent("codex-cli")).strip()
+    UPSTREAM_APP_NAME = (os.environ.get("AUGGIE_LAUNCH_UPSTREAM_APP_NAME") or "Codex").strip()
+    UPSTREAM_MIN_INTERVAL_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_UPSTREAM_MIN_INTERVAL_SECONDS"), 0.25)
+    UPSTREAM_RETRIES = bounded_int(os.environ.get("AUGGIE_LAUNCH_UPSTREAM_RETRIES"), 2)
+    UPSTREAM_429_FREEZE_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_429_FREEZE_SECONDS"), 60.0)
+    UPSTREAM_5XX_FREEZE_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_5XX_FREEZE_SECONDS"), 30.0)
+    UPSTREAM_MAX_RETRY_AFTER_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_MAX_RETRY_AFTER_SECONDS"), 300.0)
+    UPSTREAM_BACKOFF_INITIAL_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_BACKOFF_INITIAL_SECONDS"), 1.0)
+    UPSTREAM_BACKOFF_MAX_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_BACKOFF_MAX_SECONDS"), 30.0)
+    SANITIZE_UPSTREAM_PROMPTS = env_truthy("AUGGIE_LAUNCH_SANITIZE_UPSTREAM_PROMPTS", False)
+    INDEXING_MODE = (os.environ.get("AUGGIE_LAUNCH_INDEXING_MODE") or "complete").strip().lower()
+    MODEL_CONTEXT_TOKENS = env_int("AUGGIE_LAUNCH_MODEL_CONTEXT_TOKENS", 200000)
+    MODEL_CONTEXT_TOKENS_EXPLICIT = bool((os.environ.get("AUGGIE_LAUNCH_MODEL_CONTEXT_TOKENS") or "").strip())
+    REQUIRE_LOCAL_TOKEN = env_truthy("AUGGIE_LAUNCH_REQUIRE_LOCAL_TOKEN", True)
+    MODEL_MAX_OUTPUT_TOKENS = env_int("AUGGIE_LAUNCH_MODEL_MAX_OUTPUT_TOKENS", 16000)
+    REASONING_EFFORT = (os.environ.get("AUGGIE_LAUNCH_REASONING_EFFORT") or "").strip().lower()
+    if REASONING_EFFORT and REASONING_EFFORT not in {"low", "medium", "high"}:
+        print("error: AUGGIE_LAUNCH_REASONING_EFFORT must be low, medium, or high", file=sys.stderr)
+        sys.exit(2)
+
+    STREAM_THINKING = env_truthy("AUGGIE_LAUNCH_STREAM_THINKING", True)
+    IS_9ROUTER = detect_9router(TARGET_BASE_URL)
+
+    # Auto-install 9router when the system cannot detect it at all
+    if IS_9ROUTER and not _LOCAL_9ROUTER.installed and env_truthy("AUGGIE_LAUNCH_AUTO_INSTALL_9ROUTER", True):
+        from .ninerouter import ensure_9router_installed  # imported here: ninerouter depends on config
+
+        if ensure_9router_installed():
+            _LOCAL_9ROUTER = read_local_9router_state()
+
+    # Tunnel fallback target: 9router's Cloudflare URL + the local base path (e.g. /v1)
+    global TUNNEL_BASE_URL, ACTIVE_BASE_URL
+    ACTIVE_BASE_URL = ""
+    TUNNEL_BASE_URL = ""
+    if _LOCAL_9ROUTER.tunnel_url:
+        base_path = urllib.parse.urlparse(TARGET_BASE_URL).path.rstrip("/")
+        TUNNEL_BASE_URL = _LOCAL_9ROUTER.tunnel_url.rstrip("/") + base_path
+
+    ROUTER_CAVEMAN_MODE = env_truthy("AUGGIE_LAUNCH_9ROUTER_CAVEMAN", _LOCAL_9ROUTER.caveman_enabled)
+    ROUTER_CAVEMAN_LEVEL = (os.environ.get("AUGGIE_LAUNCH_9ROUTER_CAVEMAN_LEVEL") or _LOCAL_9ROUTER.caveman_level).strip().lower()
+    ROUTER_PROVIDER = (os.environ.get("AUGGIE_LAUNCH_9ROUTER_PROVIDER") or "").strip()
+    DYNAMIC_MODELS = env_truthy("AUGGIE_LAUNCH_DYNAMIC_MODELS", True)
+    USE_COMPLETION_TOKENS = (os.environ.get("AUGGIE_LAUNCH_USE_COMPLETION_TOKENS") or "auto").strip().lower()
+    ENABLE_CONNECTION_POOL = env_truthy("AUGGIE_LAUNCH_CONNECTION_POOL", True)
+    AUTO_INJECT_MCP = env_truthy("AUGGIE_LAUNCH_AUTO_INJECT_MCP", True)
+
+
+def log(message: str) -> None:
+    if VERBOSE:
+        print(f"[auggie-launch] {message}", file=sys.stderr)
+
+

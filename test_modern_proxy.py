@@ -15,7 +15,7 @@ import auggie_launch as main
 class TestTokenAndAtomicTruncation(unittest.TestCase):
     def test_estimate_tokens(self):
         text = "def hello():\n    return 'world'"
-        tokens = main.estimate_tokens_heuristic(text)
+        tokens = main.truncation.estimate_tokens_heuristic(text)
         self.assertGreater(tokens, 0)
         self.assertLess(tokens, len(text))
 
@@ -37,7 +37,7 @@ class TestTokenAndAtomicTruncation(unittest.TestCase):
             {"role": "user", "content": "Now read file1.txt."},
         ]
 
-        system_msgs, turns = main.group_messages_into_turns(messages)
+        system_msgs, turns = main.truncation.group_messages_into_turns(messages)
         self.assertEqual(len(system_msgs), 1)
         self.assertEqual(system_msgs[0]["content"], "You are a coding assistant.")
 
@@ -70,7 +70,7 @@ class TestTokenAndAtomicTruncation(unittest.TestCase):
             {"role": "user", "content": "Latest user query."},
         ]
 
-        truncated = main.truncate_messages_to_context_limit(messages, max_context_tokens=5000)
+        truncated = main.truncation.truncate_messages_to_context_limit(messages, max_context_tokens=5000)
 
         # Verify system message and latest user message are retained
         self.assertEqual(truncated[0]["role"], "system")
@@ -91,7 +91,7 @@ class TestToolCallMergingAndJSONRepair(unittest.TestCase):
             {"index": 0, "function": {"arguments": '"app.py"}'}},
             {"index": 1, "function": {"arguments": '"main"}'}},
         ]
-        merged = main.merge_stream_tool_calls(chunks)
+        merged = main.truncation.merge_stream_tool_calls(chunks)
         self.assertEqual(len(merged), 2)
         self.assertEqual(merged[0]["id"], "call_101")
         self.assertEqual(merged[0]["function"]["name"], "read_file")
@@ -103,7 +103,7 @@ class TestToolCallMergingAndJSONRepair(unittest.TestCase):
 
     def test_json_repair_unclosed_brackets(self):
         broken = '{"key": "value", "list": [1, 2'
-        repaired = main.repair_json_arguments(broken)
+        repaired = main.truncation.repair_json_arguments(broken)
         parsed = json.loads(repaired)
         self.assertEqual(parsed.get("key"), "value")
         self.assertEqual(parsed.get("list"), [1, 2])
@@ -111,30 +111,30 @@ class TestToolCallMergingAndJSONRepair(unittest.TestCase):
 
 class Test9routerAndModelAdaptation(unittest.TestCase):
     def test_9router_detection(self):
-        self.assertTrue(main.detect_9router("http://localhost:20128/v1"))
-        self.assertTrue(main.detect_9router("http://127.0.0.1:20128/v1"))
-        self.assertTrue(main.detect_9router("https://my-9router.internal:8080/v1"))
-        self.assertFalse(main.detect_9router("https://api.openai.com/v1"))
+        self.assertTrue(main.config.detect_9router("http://localhost:20128/v1"))
+        self.assertTrue(main.config.detect_9router("http://127.0.0.1:20128/v1"))
+        self.assertTrue(main.config.detect_9router("https://my-9router.internal:8080/v1"))
+        self.assertFalse(main.config.detect_9router("https://api.openai.com/v1"))
 
     def test_completion_tokens_parameter_selection(self):
-        self.assertTrue(main.should_use_completion_tokens("o1-preview"))
-        self.assertTrue(main.should_use_completion_tokens("o3-mini"))
-        self.assertTrue(main.should_use_completion_tokens("claude-3-7-sonnet"))
-        self.assertTrue(main.should_use_completion_tokens("deepseek-r1"))
-        self.assertFalse(main.should_use_completion_tokens("gpt-3.5-turbo"))
+        self.assertTrue(main.transform.should_use_completion_tokens("o1-preview"))
+        self.assertTrue(main.transform.should_use_completion_tokens("o3-mini"))
+        self.assertTrue(main.transform.should_use_completion_tokens("claude-3-7-sonnet"))
+        self.assertTrue(main.transform.should_use_completion_tokens("deepseek-r1"))
+        self.assertFalse(main.transform.should_use_completion_tokens("gpt-3.5-turbo"))
 
     def test_full_jitter_backoff_bounds(self):
         for attempt in range(5):
-            delay = main.retry_backoff_seconds(attempt)
+            delay = main.upstream.retry_backoff_seconds(attempt)
             self.assertGreaterEqual(delay, 0.0)
-            self.assertLessEqual(delay, main.UPSTREAM_BACKOFF_MAX_SECONDS)
+            self.assertLessEqual(delay, main.config.UPSTREAM_BACKOFF_MAX_SECONDS)
 
     def test_9router_headers(self):
-        main.IS_9ROUTER = True
-        main.ROUTER_CAVEMAN_MODE = True
-        main.ROUTER_CAVEMAN_LEVEL = "ultra"
-        main.ROUTER_PROVIDER = "anthropic"
-        headers = main.upstream_headers("test-key", stream=True)
+        main.config.IS_9ROUTER = True
+        main.config.ROUTER_CAVEMAN_MODE = True
+        main.config.ROUTER_CAVEMAN_LEVEL = "ultra"
+        main.config.ROUTER_PROVIDER = "anthropic"
+        headers = main.upstream.upstream_headers("test-key", stream=True)
         self.assertEqual(headers.get("X-Source"), "auggie-launch")
         self.assertEqual(headers.get("X-RTK"), "true")
         self.assertEqual(headers.get("X-Caveman-Mode"), "true")
@@ -145,7 +145,7 @@ class Test9routerAndModelAdaptation(unittest.TestCase):
 
 class TestLocal9routerDiscovery(unittest.TestCase):
     def test_read_local_9router_state_integration(self):
-        state = main.read_local_9router_state()
+        state = main.config.read_local_9router_state()
         if state.installed:
             self.assertTrue(state.installed)
             self.assertTrue(os.path.isfile(state.db_path))
@@ -165,25 +165,25 @@ class TestLocal9routerDiscovery(unittest.TestCase):
 
 class TestAuggieFullInjections(unittest.TestCase):
     def setUp(self):
-        main.TARGET_BASE_URL = "http://127.0.0.1:20128/v1"
-        main.TARGET_MODEL = "free"
-        main.API_KEYS = ["sk-test-mock-key"]
-        main.ROUTER_CAVEMAN_MODE = True
-        main.ROUTER_CAVEMAN_LEVEL = "ultra"
+        main.config.TARGET_BASE_URL = "http://127.0.0.1:20128/v1"
+        main.config.TARGET_MODEL = "free"
+        main.config.API_KEYS = ["sk-test-mock-key"]
+        main.config.ROUTER_CAVEMAN_MODE = True
+        main.config.ROUTER_CAVEMAN_LEVEL = "ultra"
 
     def test_build_injected_environment(self):
         proxy_url = "http://127.0.0.1:54321"
-        env = main.build_injected_environment(proxy_url)
+        env = main.injections.build_injected_environment(proxy_url)
 
         # Core Augment variables
         self.assertEqual(env.get("AUGMENT_API_URL"), proxy_url)
-        self.assertEqual(env.get("AUGMENT_API_TOKEN"), main.LOCAL_TOKEN)
+        self.assertEqual(env.get("AUGMENT_API_TOKEN"), main.config.LOCAL_TOKEN)
         self.assertEqual(env.get("AUGMENT_DISABLE_AUTO_UPDATE"), "1")
         self.assertEqual(env.get("AUGMENT_MODEL"), "free")
 
         # Session Auth
         auth = json.loads(env.get("AUGMENT_SESSION_AUTH", "{}"))
-        self.assertEqual(auth.get("accessToken"), main.LOCAL_TOKEN)
+        self.assertEqual(auth.get("accessToken"), main.config.LOCAL_TOKEN)
         self.assertEqual(auth.get("tenantURL"), proxy_url)
 
         # Caveman system instructions injection
@@ -191,20 +191,20 @@ class TestAuggieFullInjections(unittest.TestCase):
         self.assertIn("Caveman Mode Active (ultra)", instructions)
 
         # Standard upstream provider endpoints
-        self.assertEqual(env.get("OPENAI_BASE_URL"), main.TARGET_BASE_URL)
-        self.assertEqual(env.get("ANTHROPIC_BASE_URL"), main.TARGET_BASE_URL)
+        self.assertEqual(env.get("OPENAI_BASE_URL"), main.config.TARGET_BASE_URL)
+        self.assertEqual(env.get("ANTHROPIC_BASE_URL"), main.config.TARGET_BASE_URL)
         self.assertEqual(env.get("OPENAI_API_KEY"), "sk-test-mock-key")
 
         # 9router provider keys if installed
-        if main._LOCAL_9ROUTER.installed:
-            if "tavily" in main._LOCAL_9ROUTER.provider_api_keys:
-                self.assertEqual(env.get("TAVILY_API_KEY"), main._LOCAL_9ROUTER.provider_api_keys["tavily"])
+        if main.config._LOCAL_9ROUTER.installed:
+            if "tavily" in main.config._LOCAL_9ROUTER.provider_api_keys:
+                self.assertEqual(env.get("TAVILY_API_KEY"), main.config._LOCAL_9ROUTER.provider_api_keys["tavily"])
 
         # PATH enhancement
         self.assertIn("/bin", env.get("PATH", ""))
 
     def test_generate_injected_mcp_config(self):
-        mcp_path = main.generate_injected_mcp_config()
+        mcp_path = main.injections.generate_injected_mcp_config()
         if mcp_path:
             self.assertTrue(os.path.isfile(mcp_path))
             with open(mcp_path, encoding="utf-8") as f:
@@ -214,13 +214,13 @@ class TestAuggieFullInjections(unittest.TestCase):
 
 class TestMockedNetworkOperations(unittest.TestCase):
     def setUp(self):
-        main.reset_throttles()
-        main.TARGET_BASE_URL = "http://127.0.0.1:20128/v1"
-        main.TARGET_MODEL = "claude-3-7-sonnet"
-        main.API_KEYS = ["sk-test-mock-key"]
-        main.IS_9ROUTER = True
+        main.upstream.reset_throttles()
+        main.config.TARGET_BASE_URL = "http://127.0.0.1:20128/v1"
+        main.config.TARGET_MODEL = "claude-3-7-sonnet"
+        main.config.API_KEYS = ["sk-test-mock-key"]
+        main.config.IS_9ROUTER = True
 
-    @patch("auggie_launch._CONNECTION_POOL.acquire")
+    @patch("auggie_launch.upstream._CONNECTION_POOL.acquire")
     def test_dynamic_models_fetch_mocked(self, mock_acquire):
         mock_conn = MagicMock()
         mock_res = MagicMock()
@@ -236,17 +236,17 @@ class TestMockedNetworkOperations(unittest.TestCase):
         mock_conn.getresponse.return_value = mock_res
         mock_acquire.return_value = mock_conn
 
-        main._CACHED_MODELS = []
-        main._CACHED_MODELS_TIME = 0.0
+        main.config._CACHED_MODELS = []
+        main.config._CACHED_MODELS_TIME = 0.0
 
-        models = main.fetch_upstream_models()
+        models = main.models.fetch_upstream_models()
         self.assertEqual(len(models), 4)
         model_ids = [m["id"] for m in models]
         self.assertIn("free", model_ids)
         self.assertIn("claude-3-7-sonnet", model_ids)
         self.assertIn("deepseek-r1", model_ids)
 
-    @patch("auggie_launch._CONNECTION_POOL.acquire")
+    @patch("auggie_launch.upstream._CONNECTION_POOL.acquire")
     def test_open_upstream_stream_with_reasoning_mocked(self, mock_acquire):
         mock_conn = MagicMock()
         mock_res = MagicMock()
@@ -263,8 +263,8 @@ class TestMockedNetworkOperations(unittest.TestCase):
         mock_conn.getresponse.return_value = mock_res
         mock_acquire.return_value = mock_conn
 
-        req_body = main.json_bytes({"messages": [{"role": "user", "content": "hi"}], "stream": True})
-        wrapper = main.open_upstream_with_retries(req_body, stream=True, timeout=10, label="test")
+        req_body = main.upstream.json_bytes({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        wrapper = main.upstream.open_upstream_with_retries(req_body, stream=True, timeout=10, label="test")
 
         lines = [line.decode("utf-8").strip() for line in wrapper]
         wrapper.close()
@@ -272,14 +272,14 @@ class TestMockedNetworkOperations(unittest.TestCase):
         self.assertTrue(any("Refactoring step..." in line for line in lines))
         self.assertTrue(any("Final code." in line for line in lines))
 
-    @patch("auggie_launch.fetch_upstream_models")
+    @patch("auggie_launch.registry.fetch_upstream_models")
     def test_fake_models_dynamic_registry(self, mock_fetch):
         mock_fetch.return_value = [
             {"id": "free"},
             {"id": "gemini-2.5-pro"},
             {"id": "deepseek-r1"},
         ]
-        models_data = main.fake_models()
+        models_data = main.registry.fake_models()
         self.assertEqual(models_data["default_model"], "claude-3-7-sonnet")
         registry_json = models_data["feature_flags"]["model_info_registry"]
         registry = json.loads(registry_json)
@@ -292,7 +292,7 @@ class TestMockedNetworkOperations(unittest.TestCase):
         # Verify 9router local alias is in registry
         self.assertIn("big-pickle", registry)
 
-    @patch("auggie_launch._CONNECTION_POOL.acquire")
+    @patch("auggie_launch.upstream._CONNECTION_POOL.acquire")
     def test_auto_parameter_swap_on_400(self, mock_acquire):
         mock_conn = MagicMock()
         res_fail = MagicMock()
@@ -311,7 +311,7 @@ class TestMockedNetworkOperations(unittest.TestCase):
         mock_acquire.return_value = mock_conn
 
         payload = {"model": "test-model", "messages": [], "max_tokens": 1000}
-        wrapper = main.open_upstream_with_retries(main.json_bytes(payload), stream=False, timeout=10, label="swap-test")
+        wrapper = main.upstream.open_upstream_with_retries(main.upstream.json_bytes(payload), stream=False, timeout=10, label="swap-test")
         self.assertEqual(wrapper.status, 200)
         wrapper.close()
 
@@ -327,161 +327,161 @@ class TestMockedNetworkOperations(unittest.TestCase):
 class Test9routerCatalogContext(unittest.TestCase):
     def test_lookup_catalog_context_exact_match(self):
         """Test exact model ID match in catalog."""
-        main.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 128000}}
-        self.assertEqual(main.lookup_catalog_context("gpt-4o"), 128000)
+        main.config.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 128000}}
+        self.assertEqual(main.models.lookup_catalog_context("gpt-4o"), 128000)
 
     def test_lookup_catalog_context_last_segment(self):
         """Test last segment match for namespaced models."""
-        main.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 128000}}
-        self.assertEqual(main.lookup_catalog_context("openai/gpt-4o"), 128000)
+        main.config.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 128000}}
+        self.assertEqual(main.models.lookup_catalog_context("openai/gpt-4o"), 128000)
 
     def test_lookup_catalog_context_missing_returns_zero(self):
         """Test missing model returns 0."""
-        main.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 128000}}
-        self.assertEqual(main.lookup_catalog_context("unknown-model"), 0)
+        main.config.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 128000}}
+        self.assertEqual(main.models.lookup_catalog_context("unknown-model"), 0)
 
     def test_lookup_catalog_context_empty_catalog(self):
         """Test empty catalog returns 0."""
-        main.CACHED_CATALOG = {}
-        self.assertEqual(main.lookup_catalog_context("any-model"), 0)
+        main.config.CACHED_CATALOG = {}
+        self.assertEqual(main.models.lookup_catalog_context("any-model"), 0)
 
     def test_model_context_limit_catalog_priority(self):
         """Test catalog context takes priority over heuristics."""
-        main.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 200000}}
+        main.config.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 200000}}
         # Even though heuristic would give 200000, catalog provides same
-        self.assertEqual(main.model_context_limit("gpt-4o"), 200000)
+        self.assertEqual(main.models.model_context_limit("gpt-4o"), 200000)
 
     def test_model_context_limit_heuristic_fallback(self):
         """Test heuristic fallback when model not in catalog."""
-        main.CACHED_CATALOG = {}
-        self.assertEqual(main.model_context_limit("gemini-2.5-pro"), 1000000)
-        self.assertEqual(main.model_context_limit("claude-3.5-sonnet"), 200000)
-        self.assertEqual(main.model_context_limit("deepseek-chat"), 128000)
+        main.config.CACHED_CATALOG = {}
+        self.assertEqual(main.models.model_context_limit("gemini-2.5-pro"), 1000000)
+        self.assertEqual(main.models.model_context_limit("claude-3.5-sonnet"), 200000)
+        self.assertEqual(main.models.model_context_limit("deepseek-chat"), 128000)
 
 
 class TestProviderApiKeyMapping(unittest.TestCase):
     def test_build_injected_environment_tavily(self):
         """Test tavily API key mapping."""
         with patch.dict(os.environ, {}, clear=True):
-            with patch('auggie_launch._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"tavily": "tvly-test-key"})):
-                env = main.build_injected_environment("http://localhost:50108")
+            with patch('auggie_launch.config._LOCAL_9ROUTER', main.config.NineRouterLocalState(provider_api_keys={"tavily": "tvly-test-key"})):
+                env = main.injections.build_injected_environment("http://localhost:50108")
                 self.assertEqual(env.get("TAVILY_API_KEY"), "tvly-test-key")
 
     def test_build_injected_environment_firecrawl(self):
         """Test firecrawl API key mapping."""
         with patch.dict(os.environ, {}, clear=True):
-            with patch('auggie_launch._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"firecrawl": "fc-test-key"})):
-                env = main.build_injected_environment("http://localhost:50108")
+            with patch('auggie_launch.config._LOCAL_9ROUTER', main.config.NineRouterLocalState(provider_api_keys={"firecrawl": "fc-test-key"})):
+                env = main.injections.build_injected_environment("http://localhost:50108")
                 self.assertEqual(env.get("FIRECRAWL_API_KEY"), "fc-test-key")
 
     def test_build_injected_environment_jina_reader(self):
         """Test jina-reader API key mapping (hyphen normalized)."""
         with patch.dict(os.environ, {}, clear=True):
-            with patch('auggie_launch._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"jina-reader": "jina-test-key"})):
-                env = main.build_injected_environment("http://localhost:50108")
+            with patch('auggie_launch.config._LOCAL_9ROUTER', main.config.NineRouterLocalState(provider_api_keys={"jina-reader": "jina-test-key"})):
+                env = main.injections.build_injected_environment("http://localhost:50108")
                 self.assertEqual(env.get("JINA_API_KEY"), "jina-test-key")
 
     def test_build_injected_environment_minimax(self):
         """Test minimax API key mapping."""
         with patch.dict(os.environ, {}, clear=True):
-            with patch('auggie_launch._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"minimax": "mm-test-key"})):
-                env = main.build_injected_environment("http://localhost:50108")
+            with patch('auggie_launch.config._LOCAL_9ROUTER', main.config.NineRouterLocalState(provider_api_keys={"minimax": "mm-test-key"})):
+                env = main.injections.build_injected_environment("http://localhost:50108")
                 self.assertEqual(env.get("MINIMAX_API_KEY"), "mm-test-key")
 
     def test_build_injected_environment_generic_fallback(self):
         """Test generic {NORM}_API_KEY fallback for unknown providers."""
         with patch.dict(os.environ, {}, clear=True):
-            with patch('auggie_launch._LOCAL_9ROUTER', main.NineRouterLocalState(provider_api_keys={"custom-provider": "custom-key"})):
-                env = main.build_injected_environment("http://localhost:50108")
+            with patch('auggie_launch.config._LOCAL_9ROUTER', main.config.NineRouterLocalState(provider_api_keys={"custom-provider": "custom-key"})):
+                env = main.injections.build_injected_environment("http://localhost:50108")
                 self.assertEqual(env.get("CUSTOM_PROVIDER_API_KEY"), "custom-key")
 
 
 class TestTunnelFallback(unittest.TestCase):
-    @patch("auggie_launch.socket.socket")
+    @patch("auggie_launch.upstream.socket.socket")
     def test_tunnel_fallback_ping_success(self, mock_socket_class):
         """Test tunnel fallback ping returns True on success."""
         mock_sock = MagicMock()
         mock_socket_class.return_value = mock_sock
-        state = main.NineRouterLocalState()
+        state = main.config.NineRouterLocalState()
         state.tunnel_url = "https://test.example.com"
-        result = main._ping_tunnel(state.tunnel_url)
+        result = main.upstream._ping_tunnel(state.tunnel_url)
         self.assertTrue(result)
         mock_sock.connect.assert_called_once_with(("test.example.com", 443))
 
-    @patch("auggie_launch.socket.socket")
+    @patch("auggie_launch.upstream.socket.socket")
     def test_tunnel_fallback_ping_failure(self, mock_socket_class):
         """Test tunnel fallback ping returns False on failure."""
         mock_sock = MagicMock()
         mock_sock.connect.side_effect = socket.timeout
         mock_socket_class.return_value = mock_sock
-        state = main.NineRouterLocalState()
+        state = main.config.NineRouterLocalState()
         state.tunnel_url = "https://test.example.com"
-        result = main._ping_tunnel(state.tunnel_url)
+        result = main.upstream._ping_tunnel(state.tunnel_url)
         self.assertFalse(result)
 
     def test_tunnel_fallback_ping_invalid_url(self):
         """Test tunnel fallback ping returns False for invalid URL."""
-        state = main.NineRouterLocalState()
+        state = main.config.NineRouterLocalState()
         state.tunnel_url = "not-a-url"
-        result = main._ping_tunnel(state.tunnel_url)
+        result = main.upstream._ping_tunnel(state.tunnel_url)
         self.assertFalse(result)
 
 
 class TestRuntimeTunnelFailover(unittest.TestCase):
     def setUp(self):
-        self._saved = (main.TARGET_BASE_URL, main.ACTIVE_BASE_URL, main.TUNNEL_BASE_URL)
-        main.TARGET_BASE_URL = "http://localhost:20128/v1"
-        main.ACTIVE_BASE_URL = ""
-        main.TUNNEL_BASE_URL = "https://tunnel.example.com/v1"
+        self._saved = (main.config.TARGET_BASE_URL, main.config.ACTIVE_BASE_URL, main.config.TUNNEL_BASE_URL)
+        main.config.TARGET_BASE_URL = "http://localhost:20128/v1"
+        main.config.ACTIVE_BASE_URL = ""
+        main.config.TUNNEL_BASE_URL = "https://tunnel.example.com/v1"
 
     def tearDown(self):
-        main.TARGET_BASE_URL, main.ACTIVE_BASE_URL, main.TUNNEL_BASE_URL = self._saved
+        main.config.TARGET_BASE_URL, main.config.ACTIVE_BASE_URL, main.config.TUNNEL_BASE_URL = self._saved
 
     def test_active_base_url_defaults_to_target(self):
-        self.assertEqual(main.active_base_url(), "http://localhost:20128/v1")
-        self.assertEqual(main.upstream_url(), "http://localhost:20128/v1/chat/completions")
+        self.assertEqual(main.upstream.active_base_url(), "http://localhost:20128/v1")
+        self.assertEqual(main.upstream.upstream_url(), "http://localhost:20128/v1/chat/completions")
 
-    @patch("auggie_launch._ping_tunnel", return_value=True)
+    @patch("auggie_launch.upstream._ping_tunnel", return_value=True)
     def test_switch_to_tunnel_when_reachable(self, _ping):
-        self.assertTrue(main.switch_to_tunnel("connection refused"))
-        self.assertEqual(main.active_base_url(), "https://tunnel.example.com/v1")
-        self.assertEqual(main.upstream_url(), "https://tunnel.example.com/v1/chat/completions")
+        self.assertTrue(main.upstream.switch_to_tunnel("connection refused"))
+        self.assertEqual(main.upstream.active_base_url(), "https://tunnel.example.com/v1")
+        self.assertEqual(main.upstream.upstream_url(), "https://tunnel.example.com/v1/chat/completions")
         # second call is a no-op once already switched
-        self.assertFalse(main.switch_to_tunnel("connection refused"))
+        self.assertFalse(main.upstream.switch_to_tunnel("connection refused"))
 
-    @patch("auggie_launch._ping_tunnel", return_value=False)
+    @patch("auggie_launch.upstream._ping_tunnel", return_value=False)
     def test_no_switch_when_tunnel_unreachable(self, _ping):
-        self.assertFalse(main.switch_to_tunnel("connection refused"))
-        self.assertEqual(main.active_base_url(), "http://localhost:20128/v1")
+        self.assertFalse(main.upstream.switch_to_tunnel("connection refused"))
+        self.assertEqual(main.upstream.active_base_url(), "http://localhost:20128/v1")
 
     def test_no_switch_without_tunnel_configured(self):
-        main.TUNNEL_BASE_URL = ""
-        self.assertFalse(main.switch_to_tunnel("connection refused"))
-        self.assertEqual(main.active_base_url(), "http://localhost:20128/v1")
+        main.config.TUNNEL_BASE_URL = ""
+        self.assertFalse(main.upstream.switch_to_tunnel("connection refused"))
+        self.assertEqual(main.upstream.active_base_url(), "http://localhost:20128/v1")
 
 
 class Test9routerInstallAndRestore(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self._saved_backup_dir = main._BUNDLED_DB_BACKUP_DIR
-        main._BUNDLED_DB_BACKUP_DIR = os.path.join(self.tmp, "backups")
-        os.makedirs(main._BUNDLED_DB_BACKUP_DIR)
-        self.backup = os.path.join(main._BUNDLED_DB_BACKUP_DIR, "9router-backup-test.json")
+        self._saved_backup_dir = main.ninerouter._BUNDLED_DB_BACKUP_DIR
+        main.ninerouter._BUNDLED_DB_BACKUP_DIR = os.path.join(self.tmp, "backups")
+        os.makedirs(main.ninerouter._BUNDLED_DB_BACKUP_DIR)
+        self.backup = os.path.join(main.ninerouter._BUNDLED_DB_BACKUP_DIR, "9router-backup-test.json")
         with open(self.backup, "w", encoding="utf-8") as f:
             json.dump({"settings": {"cavemanEnabled": True}, "combos": []}, f)
         self.home = os.path.join(self.tmp, "home")
         os.makedirs(self.home)
 
     def tearDown(self):
-        main._BUNDLED_DB_BACKUP_DIR = self._saved_backup_dir
+        main.ninerouter._BUNDLED_DB_BACKUP_DIR = self._saved_backup_dir
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_latest_bundled_db_backup(self):
-        self.assertEqual(main.latest_bundled_db_backup(), self.backup)
+        self.assertEqual(main.ninerouter.latest_bundled_db_backup(), self.backup)
 
     def test_restore_creates_db_when_missing(self):
-        with patch("auggie_launch.os.path.expanduser", return_value=self.home):
-            self.assertTrue(main.restore_9router_db())
+        with patch("auggie_launch.ninerouter.os.path.expanduser", return_value=self.home):
+            self.assertTrue(main.ninerouter.restore_9router_db())
         db_file = os.path.join(self.home, ".9router", "db.json")
         self.assertTrue(os.path.isfile(db_file))
         with open(db_file, encoding="utf-8") as f:
@@ -493,9 +493,9 @@ class Test9routerInstallAndRestore(unittest.TestCase):
         db_file = os.path.join(nine_dir, "db.json")
         with open(db_file, "w", encoding="utf-8") as f:
             json.dump({"settings": {"keep": True}}, f)
-        with patch("auggie_launch.os.path.expanduser", return_value=self.home):
-            self.assertFalse(main.restore_9router_db())
-            self.assertTrue(main.restore_9router_db(force=True))
+        with patch("auggie_launch.ninerouter.os.path.expanduser", return_value=self.home):
+            self.assertFalse(main.ninerouter.restore_9router_db())
+            self.assertTrue(main.ninerouter.restore_9router_db(force=True))
         self.assertTrue(os.path.isfile(db_file + ".bak"))
         with open(db_file, encoding="utf-8") as f:
             self.assertTrue(json.load(f)["settings"]["cavemanEnabled"])
@@ -503,33 +503,33 @@ class Test9routerInstallAndRestore(unittest.TestCase):
     def test_restore_rejects_non_9router_json(self):
         with open(self.backup, "w", encoding="utf-8") as f:
             json.dump({"not": "a db"}, f)
-        with patch("auggie_launch.os.path.expanduser", return_value=self.home):
-            self.assertFalse(main.restore_9router_db())
+        with patch("auggie_launch.ninerouter.os.path.expanduser", return_value=self.home):
+            self.assertFalse(main.ninerouter.restore_9router_db())
 
-    @patch("auggie_launch.subprocess.run")
-    @patch("auggie_launch.shutil.which", return_value="/usr/local/bin/npm")
+    @patch("auggie_launch.ninerouter.subprocess.run")
+    @patch("auggie_launch.ninerouter.shutil.which", return_value="/usr/local/bin/npm")
     def test_install_9router_runs_npm_prefer_online(self, _which, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
-        with patch("auggie_launch.find_9router_binary", return_value="/usr/local/bin/9router"):
-            self.assertTrue(main.install_9router())
+        with patch("auggie_launch.ninerouter.find_9router_binary", return_value="/usr/local/bin/9router"):
+            self.assertTrue(main.ninerouter.install_9router())
         args = mock_run.call_args[0][0]
         self.assertEqual(args[1:], ["i", "-g", "9router@latest", "--prefer-online"])
 
-    @patch("auggie_launch.shutil.which", return_value=None)
+    @patch("auggie_launch.ninerouter.shutil.which", return_value=None)
     def test_install_9router_without_npm(self, _which):
-        self.assertFalse(main.install_9router())
+        self.assertFalse(main.ninerouter.install_9router())
 
-    @patch("auggie_launch.subprocess.run")
-    @patch("auggie_launch.shutil.which", return_value="/usr/local/bin/npm")
+    @patch("auggie_launch.ninerouter.subprocess.run")
+    @patch("auggie_launch.ninerouter.shutil.which", return_value="/usr/local/bin/npm")
     def test_install_9router_npm_failure(self, _which, mock_run):
         mock_run.return_value = MagicMock(returncode=1)
-        self.assertFalse(main.install_9router())
+        self.assertFalse(main.ninerouter.install_9router())
 
-    @patch("auggie_launch.install_9router", return_value=True)
-    @patch("auggie_launch.restore_9router_db", return_value=True)
+    @patch("auggie_launch.ninerouter.install_9router", return_value=True)
+    @patch("auggie_launch.ninerouter.restore_9router_db", return_value=True)
     def test_ensure_installs_when_binary_missing(self, mock_restore, mock_install):
-        with patch("auggie_launch.find_9router_binary", side_effect=[None, "/usr/local/bin/9router"]):
-            self.assertTrue(main.ensure_9router_installed())
+        with patch("auggie_launch.ninerouter.find_9router_binary", side_effect=[None, "/usr/local/bin/9router"]):
+            self.assertTrue(main.ninerouter.ensure_9router_installed())
         mock_install.assert_called_once()
         mock_restore.assert_called_once()
 
@@ -537,59 +537,59 @@ class Test9routerInstallAndRestore(unittest.TestCase):
 class TestModelContextInjection(unittest.TestCase):
     def setUp(self):
         self._saved = (
-            main.TARGET_MODEL,
-            main.CACHED_CATALOG,
-            main._LOCAL_9ROUTER,
-            main.MODEL_CONTEXT_TOKENS,
-            main.MODEL_CONTEXT_TOKENS_EXPLICIT,
-            main.MODEL_MAX_OUTPUT_TOKENS,
+            main.config.TARGET_MODEL,
+            main.config.CACHED_CATALOG,
+            main.config._LOCAL_9ROUTER,
+            main.config.MODEL_CONTEXT_TOKENS,
+            main.config.MODEL_CONTEXT_TOKENS_EXPLICIT,
+            main.config.MODEL_MAX_OUTPUT_TOKENS,
         )
-        main.TARGET_MODEL = "free"
-        main.MODEL_CONTEXT_TOKENS = 200000
-        main.MODEL_CONTEXT_TOKENS_EXPLICIT = False
-        main.MODEL_MAX_OUTPUT_TOKENS = 16000
-        main.CACHED_CATALOG = {
+        main.config.TARGET_MODEL = "free"
+        main.config.MODEL_CONTEXT_TOKENS = 200000
+        main.config.MODEL_CONTEXT_TOKENS_EXPLICIT = False
+        main.config.MODEL_MAX_OUTPUT_TOKENS = 16000
+        main.config.CACHED_CATALOG = {
             "big-model": {"contextWindow": 1000000},
             "small-model": {"contextWindow": 32000},
             "mid-model": {"contextWindow": 128000},
         }
-        main._LOCAL_9ROUTER = main.NineRouterLocalState(
+        main.config._LOCAL_9ROUTER = main.config.NineRouterLocalState(
             combos=[{"name": "free", "models": ["oc/big-model", "oc/small-model", "oc/mid-model"]}],
             model_aliases={"fast-alias": "oc/big-model"},
         )
 
     def tearDown(self):
         (
-            main.TARGET_MODEL,
-            main.CACHED_CATALOG,
-            main._LOCAL_9ROUTER,
-            main.MODEL_CONTEXT_TOKENS,
-            main.MODEL_CONTEXT_TOKENS_EXPLICIT,
-            main.MODEL_MAX_OUTPUT_TOKENS,
+            main.config.TARGET_MODEL,
+            main.config.CACHED_CATALOG,
+            main.config._LOCAL_9ROUTER,
+            main.config.MODEL_CONTEXT_TOKENS,
+            main.config.MODEL_CONTEXT_TOKENS_EXPLICIT,
+            main.config.MODEL_MAX_OUTPUT_TOKENS,
         ) = self._saved
 
     def test_combo_context_uses_weakest_member(self):
         """A combo can fall back to any member, so its window is the smallest one."""
-        self.assertEqual(main.effective_context_limit("free"), 32000)
+        self.assertEqual(main.models.effective_context_limit("free"), 32000)
 
     def test_alias_context_resolves_through_target(self):
-        self.assertEqual(main.effective_context_limit("fast-alias"), 1000000)
+        self.assertEqual(main.models.effective_context_limit("fast-alias"), 1000000)
 
     def test_explicit_env_override_wins(self):
-        main.MODEL_CONTEXT_TOKENS = 64000
-        main.MODEL_CONTEXT_TOKENS_EXPLICIT = True
-        self.assertEqual(main.effective_context_limit("free"), 64000)
+        main.config.MODEL_CONTEXT_TOKENS = 64000
+        main.config.MODEL_CONTEXT_TOKENS_EXPLICIT = True
+        self.assertEqual(main.models.effective_context_limit("free"), 64000)
 
     def test_model_list_entry_budgets_track_context(self):
-        small = main.model_list_entry("small-model", 32000)
-        big = main.model_list_entry("big-model", 1000000)
+        small = main.registry.model_list_entry("small-model", 32000)
+        big = main.registry.model_list_entry("big-model", 1000000)
         self.assertEqual(small["suggested_prefix_char_count"], 32000)
         self.assertEqual(big["suggested_prefix_char_count"], 200000)  # capped
         self.assertEqual(small["suggested_prefix_char_count"], small["suggested_suffix_char_count"])
 
     def test_fake_models_reports_per_model_context(self):
-        with patch("auggie_launch.DYNAMIC_MODELS", False):
-            payload = main.fake_models()
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False):
+            payload = main.registry.fake_models()
         self.assertTrue(payload["models"])
         names = {m["name"] for m in payload["models"]}
         self.assertIn("free", names)
@@ -601,49 +601,49 @@ class TestModelContextInjection(unittest.TestCase):
         self.assertEqual(entry["suggested_prefix_char_count"], 32000)
 
     def test_resolve_request_model_honours_known_models(self):
-        self.assertEqual(main.resolve_request_model({"model": "fast-alias"}), "fast-alias")
-        self.assertEqual(main.resolve_request_model({"model": "who-is-this"}), "free")
-        self.assertEqual(main.resolve_request_model({}), "free")
+        self.assertEqual(main.models.resolve_request_model({"model": "fast-alias"}), "fast-alias")
+        self.assertEqual(main.models.resolve_request_model({"model": "who-is-this"}), "free")
+        self.assertEqual(main.models.resolve_request_model({}), "free")
 
     def test_build_openai_request_caps_output_tokens(self):
-        request = main.build_openai_request(
+        request = main.transform.build_openai_request(
             {"model": "free", "message": "hi", "max_tokens": 900000},
             stream=False,
         )
         self.assertEqual(request["model"], "free")
         field = "max_completion_tokens" if "max_completion_tokens" in request else "max_tokens"
-        self.assertLessEqual(request[field], main.MODEL_MAX_OUTPUT_TOKENS)
+        self.assertLessEqual(request[field], main.config.MODEL_MAX_OUTPUT_TOKENS)
 
 
 class TestLocalProxyAuthorization(unittest.TestCase):
     def _handler(self, header_value=None):
-        handler = main.AuggieProxy.__new__(main.AuggieProxy)
+        handler = main.proxy.AuggieProxy.__new__(main.proxy.AuggieProxy)
         handler.headers = {"Authorization": header_value} if header_value else {}
         handler.send_json = MagicMock()
         return handler
 
     def test_health_and_token_paths_are_open(self):
         handler = self._handler()
-        with patch("auggie_launch.REQUIRE_LOCAL_TOKEN", True):
+        with patch("auggie_launch.config.REQUIRE_LOCAL_TOKEN", True):
             self.assertTrue(handler.authorized("health"))
             self.assertTrue(handler.authorized("token"))
         handler.send_json.assert_not_called()
 
     def test_valid_token_allowed(self):
         handler = self._handler("Bearer secret-token")
-        with patch("auggie_launch.REQUIRE_LOCAL_TOKEN", True), patch("auggie_launch.LOCAL_TOKEN", "secret-token"):
+        with patch("auggie_launch.config.REQUIRE_LOCAL_TOKEN", True), patch("auggie_launch.config.LOCAL_TOKEN", "secret-token"):
             self.assertTrue(handler.authorized("chat-stream"))
 
     def test_missing_or_wrong_token_rejected(self):
         handler = self._handler("Bearer nope")
-        with patch("auggie_launch.REQUIRE_LOCAL_TOKEN", True), patch("auggie_launch.LOCAL_TOKEN", "secret-token"):
+        with patch("auggie_launch.config.REQUIRE_LOCAL_TOKEN", True), patch("auggie_launch.config.LOCAL_TOKEN", "secret-token"):
             self.assertFalse(handler.authorized("chat-stream"))
         handler.send_json.assert_called_once()
         self.assertEqual(handler.send_json.call_args.kwargs["status"], 401)
 
     def test_enforcement_can_be_disabled(self):
         handler = self._handler()
-        with patch("auggie_launch.REQUIRE_LOCAL_TOKEN", False):
+        with patch("auggie_launch.config.REQUIRE_LOCAL_TOKEN", False):
             self.assertTrue(handler.authorized("chat-stream"))
 
 

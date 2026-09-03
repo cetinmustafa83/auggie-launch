@@ -32,8 +32,8 @@ jobs:
           AUGGIE_LAUNCH_API_KEY: ci-dummy-key
           AUGGIE_LAUNCH_AUTO_INSTALL_9ROUTER: "false"
         run: |
-          python auggie_launch.py --help
-          python auggie_launch.py --print-env
+          python -m auggie_launch --help
+          python -m auggie_launch --print-env
 
   lint:
     name: lint & types
