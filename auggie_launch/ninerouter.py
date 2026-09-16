@@ -374,10 +374,17 @@ def print_env(port: int) -> None:
 
 
 def stop_server(httpd: ThreadingHTTPServer) -> None:
-    """Shuts the proxy down without ever blocking the exit path (e.g. on Ctrl+C)."""
-    stopper = threading.Thread(target=httpd.shutdown, daemon=True)
-    stopper.start()
-    stopper.join(timeout=2.0)
+    """Shuts the proxy down without ever blocking the exit path (e.g. on Ctrl+C).
+
+    Interrupts that arrive while we are already tearing down (a user impatiently
+    holding Ctrl+C) are swallowed so the process can still exit cleanly.
+    """
+    try:
+        stopper = threading.Thread(target=httpd.shutdown, daemon=True)
+        stopper.start()
+        stopper.join(timeout=2.0)
+    except KeyboardInterrupt:
+        pass
     try:
         httpd.server_close()
     except Exception:

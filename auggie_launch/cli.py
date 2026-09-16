@@ -129,7 +129,10 @@ def main() -> None:
         except KeyboardInterrupt:
             pass
         finally:
-            stop_server(httpd)
+            try:
+                stop_server(httpd)
+            except KeyboardInterrupt:
+                pass
         return
 
     # Build full injections into Auggie CLI environment
@@ -142,17 +145,23 @@ def main() -> None:
             pass_args = ["--mcp-config", mcp_path, *pass_args]
             log(f"injected MCP tools config from 9router: {mcp_path}")
 
+    exit_code = 0
     try:
         result = subprocess.run([config.AUGGIE_BIN, *pass_args], env=env)
-        sys.exit(result.returncode)
+        exit_code = result.returncode
     except FileNotFoundError:
         print(f"error: cannot find auggie binary ({config.AUGGIE_BIN})", file=sys.stderr)
         print("Tip: Ensure auggie is installed or run ./install.sh", file=sys.stderr)
-        sys.exit(127)
+        exit_code = 127
     except KeyboardInterrupt:
-        sys.exit(130)
+        exit_code = 130
     finally:
-        stop_server(httpd)
+        # A second Ctrl+C while shutting down must not abort the cleanup itself.
+        try:
+            stop_server(httpd)
+        except KeyboardInterrupt:
+            pass
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

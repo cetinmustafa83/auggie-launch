@@ -64,6 +64,7 @@ UPSTREAM_5XX_FREEZE_SECONDS = 30.0
 UPSTREAM_MAX_RETRY_AFTER_SECONDS = 300.0
 UPSTREAM_BACKOFF_INITIAL_SECONDS = 1.0
 UPSTREAM_BACKOFF_MAX_SECONDS = 30.0
+UPSTREAM_TIMEOUT_SECONDS = 300.0
 UPSTREAM_NEXT_REQUEST_AT = 0.0
 UPSTREAM_COOLDOWN_UNTIL = 0.0
 UPSTREAM_THROTTLE_LOCK = threading.Lock()
@@ -76,6 +77,22 @@ MODEL_MAX_OUTPUT_TOKENS = 16000
 REQUIRE_LOCAL_TOKEN = True
 REASONING_EFFORT = ""
 STREAM_THINKING = True
+
+# --- Auggie history summarization (session compaction) ---
+HISTORY_SUMMARY_ENABLED = True
+HISTORY_SUMMARY_MIN_VERSION = "0.0.1"
+HISTORY_SUMMARY_TRIGGER_TOKENS = 120000
+HISTORY_SUMMARY_MAX_HISTORY_CHARS = 100000
+HISTORY_SUMMARY_INPUT_BUDGET_RATIO = 0.6
+# --- CodeGPT Plus (agent-backed cloud) specific features ---
+IS_CODEGPT = False
+CODEGPT_SESSION_URL = ""
+CODEGPT_TOKEN = ""
+CODEGPT_AGENT_ID = ""
+CODEGPT_ORG_ID = ""
+CODEGPT_DISTINCT_ID = ""
+CODEGPT_SIGNED_DISTINCT_ID = ""
+CODEGPT_VERSION = "3.24.70"
 
 # --- 9router & Modern LLM Specific Features ---
 IS_9ROUTER = False
@@ -364,7 +381,6 @@ def detect_9router(url: str) -> bool:
         pass
     return False
 
-
 def load_config() -> None:
     global TARGET_BASE_URL, TARGET_MODEL, TARGET_API_KEY, API_KEYS, AUGGIE_BIN
     global LOCAL_TOKEN, VERBOSE, DEBUG_DIR, PORT, _LOADED_ENV_FILES
@@ -375,6 +391,7 @@ def load_config() -> None:
     global UPSTREAM_BACKOFF_MAX_SECONDS
     global INDEXING_MODE, MODEL_CONTEXT_TOKENS, MODEL_MAX_OUTPUT_TOKENS, REASONING_EFFORT
     global MODEL_CONTEXT_TOKENS_EXPLICIT, REQUIRE_LOCAL_TOKEN
+    global UPSTREAM_TIMEOUT_SECONDS
     global STREAM_THINKING, IS_9ROUTER, ROUTER_CAVEMAN_MODE, ROUTER_CAVEMAN_LEVEL
     global ROUTER_PROVIDER, DYNAMIC_MODELS, USE_COMPLETION_TOKENS, ENABLE_CONNECTION_POOL
     global CACHED_CATALOG, _LOCAL_9ROUTER, AUTO_INJECT_MCP
@@ -442,6 +459,7 @@ def load_config() -> None:
     UPSTREAM_MAX_RETRY_AFTER_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_MAX_RETRY_AFTER_SECONDS"), 300.0)
     UPSTREAM_BACKOFF_INITIAL_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_BACKOFF_INITIAL_SECONDS"), 1.0)
     UPSTREAM_BACKOFF_MAX_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_BACKOFF_MAX_SECONDS"), 30.0)
+    UPSTREAM_TIMEOUT_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_UPSTREAM_TIMEOUT"), 300.0)
     SANITIZE_UPSTREAM_PROMPTS = env_truthy("AUGGIE_LAUNCH_SANITIZE_UPSTREAM_PROMPTS", False)
     INDEXING_MODE = (os.environ.get("AUGGIE_LAUNCH_INDEXING_MODE") or "complete").strip().lower()
     MODEL_CONTEXT_TOKENS = env_int("AUGGIE_LAUNCH_MODEL_CONTEXT_TOKENS", 200000)
@@ -474,6 +492,28 @@ def load_config() -> None:
     ROUTER_CAVEMAN_MODE = env_truthy("AUGGIE_LAUNCH_9ROUTER_CAVEMAN", _LOCAL_9ROUTER.caveman_enabled)
     ROUTER_CAVEMAN_LEVEL = (os.environ.get("AUGGIE_LAUNCH_9ROUTER_CAVEMAN_LEVEL") or _LOCAL_9ROUTER.caveman_level).strip().lower()
     ROUTER_PROVIDER = (os.environ.get("AUGGIE_LAUNCH_9ROUTER_PROVIDER") or "").strip()
+
+    # CodeGPT Plus: agent-backed cloud that speaks an OpenAI-shaped SSE stream.
+    global IS_CODEGPT, CODEGPT_SESSION_URL, CODEGPT_TOKEN, CODEGPT_AGENT_ID, CODEGPT_ORG_ID
+    global CODEGPT_DISTINCT_ID, CODEGPT_SIGNED_DISTINCT_ID, CODEGPT_VERSION
+    global HISTORY_SUMMARY_ENABLED, HISTORY_SUMMARY_MIN_VERSION, HISTORY_SUMMARY_TRIGGER_TOKENS
+    global HISTORY_SUMMARY_MAX_HISTORY_CHARS, HISTORY_SUMMARY_INPUT_BUDGET_RATIO
+    # Unset -> default sidecar URL. Set-but-empty -> disable sidecar probing (pinned token).
+    _session_env = os.environ.get("AUGGIE_LAUNCH_CODEGPT_SESSION_URL")
+    CODEGPT_SESSION_URL = "http://localhost:54112/api/session" if _session_env is None else _session_env.strip()
+
+    HISTORY_SUMMARY_ENABLED = env_truthy("AUGGIE_LAUNCH_HISTORY_SUMMARY", True)
+    HISTORY_SUMMARY_MIN_VERSION = (os.environ.get("AUGGIE_LAUNCH_HISTORY_SUMMARY_MIN_VERSION") or "0.0.1").strip()
+    HISTORY_SUMMARY_TRIGGER_TOKENS = env_int("AUGGIE_LAUNCH_HISTORY_SUMMARY_TRIGGER_TOKENS", 120000)
+    HISTORY_SUMMARY_MAX_HISTORY_CHARS = env_int("AUGGIE_LAUNCH_HISTORY_SUMMARY_MAX_HISTORY_CHARS", 100000)
+    HISTORY_SUMMARY_INPUT_BUDGET_RATIO = bounded_float(os.environ.get("AUGGIE_LAUNCH_HISTORY_SUMMARY_INPUT_BUDGET_RATIO"), 0.6)
+    CODEGPT_TOKEN = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_TOKEN") or "").strip()
+    CODEGPT_AGENT_ID = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_AGENT_ID") or "").strip()
+    CODEGPT_ORG_ID = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_ORG_ID") or "").strip()
+    CODEGPT_DISTINCT_ID = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_DISTINCT_ID") or "").strip()
+    CODEGPT_SIGNED_DISTINCT_ID = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_SIGNED_DISTINCT_ID") or "").strip()
+    CODEGPT_VERSION = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_VERSION") or "3.24.70").strip()
+    IS_CODEGPT = detect_codegpt(TARGET_BASE_URL)
     DYNAMIC_MODELS = env_truthy("AUGGIE_LAUNCH_DYNAMIC_MODELS", True)
     USE_COMPLETION_TOKENS = (os.environ.get("AUGGIE_LAUNCH_USE_COMPLETION_TOKENS") or "auto").strip().lower()
     ENABLE_CONNECTION_POOL = env_truthy("AUGGIE_LAUNCH_CONNECTION_POOL", True)
@@ -483,5 +523,13 @@ def load_config() -> None:
 def log(message: str) -> None:
     if VERBOSE:
         print(f"[auggie-launch] {message}", file=sys.stderr)
+
+
+def detect_codegpt(base_url: str) -> bool:
+    """True when the upstream is CodeGPT Plus, which routes chat through an agent."""
+    if env_truthy("AUGGIE_LAUNCH_FORCE_CODEGPT", False):
+        return True
+    lowered = (base_url or "").lower()
+    return "api.codegpt.co" in lowered or "codegpt.co/api" in lowered
 
 

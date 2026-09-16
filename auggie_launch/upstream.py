@@ -84,6 +84,10 @@ def upstream_headers(api_key: str, *, stream: bool) -> dict[str, str]:
     }
     if config.UPSTREAM_USER_AGENT:
         headers["User-Agent"] = config.UPSTREAM_USER_AGENT
+    # CodeGPT Plus: identity/routing headers and a token minted by our own bridge.
+    if config.IS_CODEGPT:
+        from . import codegpt  # local import: codegpt imports config at module load
+        headers.update(codegpt.extra_headers())
 
     # 9router native headers
     if config.IS_9ROUTER or env_truthy("AUGGIE_LAUNCH_FORCE_9ROUTER", False):
@@ -134,7 +138,10 @@ def switch_to_tunnel(reason: str) -> bool:
     return True
 
 
-def upstream_url() -> str:
+def upstream_url(has_tools: bool = False) -> str:
+    if config.IS_CODEGPT:
+        from . import codegpt
+        return f"{active_base_url()}{codegpt.chat_path(has_tools)}"
     return f"{active_base_url()}/chat/completions"
 
 
@@ -222,6 +229,11 @@ def compact_upstream_error(message: str, *, max_chars: int = 1000) -> str:
 
 
 def get_active_key() -> str:
+    if config.IS_CODEGPT:
+        from . import codegpt
+        token = codegpt.session_token()
+        if token:
+            return token
     with config.FROZEN_LOCK:
         now = time.time()
         for key in config.API_KEYS:
@@ -304,15 +316,37 @@ class UpstreamResponseWrapper:
         self.close()
 
 
+def codegpt_has_tools(data: bytes) -> bool:
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except Exception:
+        return False
+    tools = payload.get("tools") if isinstance(payload, dict) else None
+    return isinstance(tools, list) and bool(tools)
+
+
 def open_upstream_with_retries(data: bytes, *, stream: bool, timeout: int, label: str) -> UpstreamResponseWrapper:
     """Executes upstream HTTP requests with Keep-Alive pool, full jitter, and parameter negotiation."""
-    parsed_url = urllib.parse.urlparse(upstream_url())
+    if config.IS_CODEGPT:
+        from . import codegpt
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            data = json_bytes(codegpt.adapt_request_body(payload))
+
+    has_tools = codegpt_has_tools(data) if config.IS_CODEGPT else False
+    parsed_url = urllib.parse.urlparse(upstream_url(has_tools))
     path_with_query = parsed_url.path or "/chat/completions"
     if parsed_url.query:
         path_with_query += f"?{parsed_url.query}"
 
     last_error: Exception | None = None
     max_attempts = max(len(config.API_KEYS), 1) + max(0, config.UPSTREAM_RETRIES)
+    if config.IS_CODEGPT:
+        # A single session token, so retries only help against transient errors.
+        max_attempts = max(1, config.UPSTREAM_RETRIES + 1)
     current_data = data
 
     for attempt in range(max_attempts):
@@ -379,7 +413,7 @@ def open_upstream_with_retries(data: bytes, *, stream: bool, timeout: int, label
             last_error = exc
             _CONNECTION_POOL.release(parsed_url, conn, reusable=False)
             if switch_to_tunnel(str(exc) or exc.__class__.__name__):
-                parsed_url = urllib.parse.urlparse(upstream_url())
+                parsed_url = urllib.parse.urlparse(upstream_url(has_tools))
                 path_with_query = parsed_url.path or "/chat/completions"
                 if parsed_url.query:
                     path_with_query += f"?{parsed_url.query}"

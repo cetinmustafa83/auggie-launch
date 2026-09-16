@@ -178,38 +178,46 @@ def repair_json_arguments(raw_args: str) -> str:
 
 
 def merge_stream_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deterministically merges streaming delta tool calls by index and id."""
-    calls_by_index: dict[int, dict[str, Any]] = {}
+    """Deterministically merges streaming delta tool calls by index and id.
+
+    Deltas for the same call share an index and accumulate argument fragments.
+    Some upstreams (CodeGPT) restart the index at 0 for every parallel call, so
+    a changing `id` also starts a new call -- otherwise two calls' arguments get
+    concatenated into invalid JSON like `{"a":1}{"b":2}`.
+    """
+    merged: list[dict[str, Any]] = []
+    by_index: dict[Any, dict[str, Any]] = {}
 
     for call in tool_calls:
         if not isinstance(call, dict):
             continue
         idx = call.get("index")
         if idx is None:
-            idx = len(calls_by_index)
-        if idx not in calls_by_index:
-            calls_by_index[idx] = {
-                "id": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                "type": "function",
-                "function": {
-                    "name": "",
-                    "arguments": "",
-                },
-            }
-        target = calls_by_index[idx]
-        if call.get("id"):
-            target["id"] = call["id"]
+            idx = len(merged)
+        call_id = call.get("id")
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
 
-        fn = call.get("function")
-        if isinstance(fn, dict):
-            if fn.get("name"):
-                target["function"]["name"] += fn["name"]
-            if fn.get("arguments"):
-                target["function"]["arguments"] += fn["arguments"]
+        target = by_index.get(idx)
+        # A new id on a seen index means a fresh parallel call, not a continuation.
+        if target is not None and call_id and target.get("id") and call_id != target["id"]:
+            target = None
+        if target is None:
+            target = {
+                "id": call_id or f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            }
+            merged.append(target)
+            by_index[idx] = target
+        elif call_id:
+            target["id"] = call_id
+        if fn.get("name"):
+            target["function"]["name"] += fn["name"]
+        if fn.get("arguments"):
+            target["function"]["arguments"] += fn["arguments"]
 
     result: list[dict[str, Any]] = []
-    for idx in sorted(calls_by_index.keys()):
-        item = calls_by_index[idx]
+    for item in merged:
         name = item["function"]["name"].strip()
         if not name:
             continue

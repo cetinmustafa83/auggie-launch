@@ -1,6 +1,13 @@
 .env
 .env.bak
+.env.bak.*
+.env.*.bak
 *.log
+.augment/
+uv.lock
+# Third-party Augment CLI copy (not part of this project)
+auggie/
+auggie-main.zip
 __pycache__/
 logs/
 tmp/

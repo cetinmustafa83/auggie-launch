@@ -13,6 +13,21 @@ from .upstream import get_active_key
 # Full Injections Engine (Environment, Session, MCP Tools)
 # ============================================================================
 
+def provider_key(name: str) -> str:
+    """Resolves a provider API key from the explicit env, then the 9router DB.
+
+    `AUGGIE_LAUNCH_<NAME>_API_KEY` is checked first so MCP servers can be wired
+    up without 9router, then the shared `<NAME>_API_KEY`, then the local 9router
+    state that historically held these keys.
+    """
+    upper = name.upper().replace("-", "_")
+    for key in (f"AUGGIE_LAUNCH_{upper}_API_KEY", f"{upper}_API_KEY"):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return value
+    return str(config._LOCAL_9ROUTER.provider_api_keys.get(name) or "").strip()
+
+
 def generate_injected_mcp_config() -> str:
     """Generates an MCP configuration file for Auggie CLI with 9router's tools."""
     home = os.path.expanduser("~")
@@ -28,17 +43,18 @@ def generate_injected_mcp_config() -> str:
             "args": [],
         }
 
-    # Tavily Web Search MCP if 9router has a key
-    tavily_key = config._LOCAL_9ROUTER.provider_api_keys.get("tavily")
+    # Tavily Web Search MCP: an explicit env key wins over the 9router DB, so it
+    # also works on a non-9router upstream like CodeGPT.
+    tavily_key = provider_key("tavily")
     if tavily_key:
         mcp_servers["tavily"] = {
             "command": "npx",
-            "args": ["-y", "@tavily/mcp-server"],
+            "args": ["-y", "tavily-mcp@latest"],
             "env": {"TAVILY_API_KEY": tavily_key},
         }
 
     # Exa MCP if configured
-    exa_key = config._LOCAL_9ROUTER.provider_api_keys.get("exa")
+    exa_key = provider_key("exa")
     if exa_key:
         mcp_servers["exa"] = {
             "command": "npx",
@@ -94,7 +110,18 @@ def build_injected_environment(proxy_url: str) -> dict[str, str]:
     env["ANTHROPIC_BASE_URL"] = config.TARGET_BASE_URL
     env["ANTHROPIC_AUTH_TOKEN"] = active_key
 
-    # 4. 9router Provider API Key Injections (all active providers, not just well-known)
+    # 4. Explicit provider keys (works without 9router; also forwarded to child tools).
+    for prov_name, env_names in {
+        "tavily": ("TAVILY_API_KEY",),
+        "exa": ("EXA_API_KEY",),
+        "firecrawl": ("FIRECRAWL_API_KEY",),
+    }.items():
+        pkey = provider_key(prov_name)
+        if pkey:
+            for env_name in env_names:
+                env.setdefault(env_name, pkey)
+
+    # 5. 9router Provider API Key Injections (all active providers, not just well-known)
     for prov_name, pkey in config._LOCAL_9ROUTER.provider_api_keys.items():
         norm = prov_name.lower().replace("-", "_").replace(" ", "_")
         if norm == "tavily":

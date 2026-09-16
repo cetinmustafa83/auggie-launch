@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from typing import Any
 
@@ -40,15 +41,89 @@ def model_list_entry(model_id: str, context_tokens: int) -> dict[str, Any]:
     }
 
 
+def model_registry_entry(model_id: str, *, description: str, group: str = "") -> dict[str, Any]:
+    """Descriptor for Auggie's model picker.
+
+    Auggie reads `displayName`/`shortName` from the registry when building the
+    `/model` menu (see its `nte()`/resolver helpers); without them the menu
+    crashes while rendering. `modelGroup` drives the picker's grouping label.
+    """
+    entry: dict[str, Any] = {
+        "humanName": model_id,
+        "displayName": model_id,
+        "shortName": model_id,
+        "description": description,
+        "encoding": "o200k_base",
+        "isRecommended": True,
+    }
+    if group:
+        entry["modelGroup"] = group
+    return entry
+
+def history_summary_params() -> str:
+    """JSON string for Auggie's `history_summary_params` feature flag.
+
+    `trigger_on_total_tokens` makes the CLI compact the session before the
+    upstream window is exhausted; `max_history_chars` bounds the abridged tail
+    that is kept verbatim. Auggie parses this as JSON and expects snake_case.
+    """
+    return json.dumps({
+        "trigger_on_total_tokens": config.HISTORY_SUMMARY_TRIGGER_TOKENS,
+        "max_history_chars": config.HISTORY_SUMMARY_MAX_HISTORY_CHARS,
+        "input_budget_trigger_ratio": config.HISTORY_SUMMARY_INPUT_BUDGET_RATIO,
+    })
+
+
+def codegpt_model_ids() -> list[str]:
+    """Models the CodeGPT Plus plan exposes, read from the extension's local DB.
+
+    Falls back to the known plan list so Auggie always has something to pick
+    even when the CodeGPT extension has not been opened on this machine yet.
+    """
+    fallback = [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "claude-sonnet-5-bedrock",
+        "glm-5.2",
+        "deepseek-v4.1-flash",
+        "laguna-s-2.1",
+        "nemotron-3-ultra",
+        "MiniMax-M3",
+        "MiniMax-M2.7",
+        "kimi-k3",
+    ]
+    path = os.path.expanduser("~/.codegpt/db.sqlite")
+    if not os.path.exists(path):
+        return fallback
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            row = con.execute("SELECT value FROM kv WHERE key LIKE 'agents-%' LIMIT 1").fetchone()
+        finally:
+            con.close()
+        if row and row[0]:
+            data = json.loads(row[0])
+            agents = data.get("agents") if isinstance(data, dict) else None
+            if isinstance(agents, list):
+                models = [a.get("model") for a in agents if isinstance(a, dict) and a.get("model")]
+                if models:
+                    return list(dict.fromkeys([*models, *fallback]))
+    except Exception:
+        pass
+    return fallback
+
+
 def fake_models() -> dict[str, Any]:
     """Builds comprehensive model list including all 9router combos, aliases, and catalog."""
     target_context = effective_context_limit(config.TARGET_MODEL)
     models_list = [model_list_entry(config.TARGET_MODEL, target_context)]
     model_registry: dict[str, Any] = {
         config.TARGET_MODEL: {
-            "humanName": config.TARGET_MODEL,
-            "description": f"{'9router' if config.IS_9ROUTER else 'OpenAI-compatible'} model via auggie-launch",
-            "encoding": "o200k_base",
+            **model_registry_entry(
+                config.TARGET_MODEL,
+                description=f"{'9router' if config.IS_9ROUTER else 'OpenAI-compatible'} model via auggie-launch",
+            ),
             "context": target_context,
             "maxOutput": config.MODEL_MAX_OUTPUT_TOKENS,
         }
@@ -56,8 +131,8 @@ def fake_models() -> dict[str, Any]:
 
     seen_models: set[str] = {config.TARGET_MODEL}
 
-    # 1. Inject 9router combos from local db.json
-    for combo in config._LOCAL_9ROUTER.combos:
+    # 1. Inject 9router combos from local db.json (only when 9router is the upstream)
+    for combo in (config._LOCAL_9ROUTER.combos if config.IS_9ROUTER else []):
         cname = combo.get("name")
         if not cname or cname in seen_models:
             continue
@@ -66,30 +141,52 @@ def fake_models() -> dict[str, Any]:
         combo_context = combo_context_limit(combo)
         models_list.append(model_list_entry(cname, combo_context))
         model_registry[cname] = {
-            "humanName": f"9router: {cname} (Combo)",
-            "description": f"Auto-fallback combo over {len(cmodels)} models: {', '.join(cmodels[:3])}...",
-            "encoding": "o200k_base",
+            **model_registry_entry(
+                cname,
+                description=f"Auto-fallback combo over {len(cmodels)} models: {', '.join(cmodels[:3])}...",
+                group="9router combos",
+            ),
             "context": combo_context,
             "maxOutput": config.MODEL_MAX_OUTPUT_TOKENS,
         }
 
-    # 2. Inject 9router model aliases from local db.json
-    for alias_name, real_target in config._LOCAL_9ROUTER.model_aliases.items():
+    # 2. Inject 9router model aliases from local db.json (only when 9router is active)
+    for alias_name, real_target in (config._LOCAL_9ROUTER.model_aliases if config.IS_9ROUTER else {}).items():
         if not alias_name or alias_name in seen_models:
             continue
         seen_models.add(alias_name)
         alias_context = effective_context_limit(alias_name)
         models_list.append(model_list_entry(alias_name, alias_context))
         model_registry[alias_name] = {
-            "humanName": f"9router: {alias_name}",
-            "description": f"Alias pointing to {real_target}",
-            "encoding": "o200k_base",
+            **model_registry_entry(
+                alias_name,
+                description=f"Alias pointing to {real_target}",
+                group="9router aliases",
+            ),
             "context": alias_context,
             "maxOutput": config.MODEL_MAX_OUTPUT_TOKENS,
         }
 
-    # 3. Inject live models from upstream /v1/models if enabled
-    if config.DYNAMIC_MODELS:
+    # 3. Inject CodeGPT Plus agent models (the agent-backed cloud has no /models)
+    if config.IS_CODEGPT:
+        for mid in codegpt_model_ids():
+            if mid in seen_models:
+                continue
+            seen_models.add(mid)
+            mid_context = effective_context_limit(mid)
+            models_list.append(model_list_entry(mid, mid_context))
+            model_registry[mid] = {
+                **model_registry_entry(
+                    mid,
+                    description="CodeGPT Plus cloud model (routed through the agent)",
+                    group="CodeGPT Plus",
+                ),
+                "context": mid_context,
+                "maxOutput": config.MODEL_MAX_OUTPUT_TOKENS,
+            }
+
+    # 4. Inject live models from upstream /v1/models if enabled
+    if config.DYNAMIC_MODELS and not config.IS_CODEGPT:
         dynamic_list = fetch_upstream_models()
         for item in dynamic_list:
             mid = item.get("id")
@@ -99,9 +196,11 @@ def fake_models() -> dict[str, Any]:
             mid_context = effective_context_limit(mid)
             models_list.append(model_list_entry(mid, mid_context))
             model_registry[mid] = {
-                "humanName": mid,
-                "description": f"Model from {'9router' if config.IS_9ROUTER else 'upstream'}",
-                "encoding": "o200k_base",
+                **model_registry_entry(
+                    mid,
+                    description=f"Model from {'9router' if config.IS_9ROUTER else 'upstream'}",
+                    group="upstream",
+                ),
                 "context": mid_context,
                 "maxOutput": config.MODEL_MAX_OUTPUT_TOKENS,
             }
@@ -127,6 +226,11 @@ def fake_models() -> dict[str, Any]:
             "agent_chat_model": config.TARGET_MODEL,
             "enable_model_registry": True,
             "model_info_registry": json.dumps(model_registry),
+            # Enables Auggie's history summarization. It is gated on a non-empty
+            # min version; without these flags the CLI never compacts a long
+            # session and eventually overflows the upstream context window.
+            "history_summary_min_version": config.HISTORY_SUMMARY_MIN_VERSION if config.HISTORY_SUMMARY_ENABLED else "",
+            "history_summary_params": history_summary_params(),
             "enable_hindsight": False,
             "bypass_language_filter": True,
             "small_sync_threshold": 1048576,

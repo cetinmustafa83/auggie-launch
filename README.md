@@ -244,9 +244,33 @@ python3 main.py --models
 | `AUGGIE_LAUNCH_CONNECTION_POOL` | `true` | Enable HTTP/1.1 Keep-Alive connection pooling |
 | `AUGGIE_LAUNCH_UPSTREAM_RETRIES` | `2` | Number of retries on 429/5xx errors |
 | `AUGGIE_LAUNCH_429_FREEZE_SECONDS` | `60.0` | Key cooldown on rate limits |
+| `AUGGIE_LAUNCH_UPSTREAM_TIMEOUT` | `300` | Upstream request timeout in seconds (streaming and JSON) |
+| `AUGGIE_LAUNCH_HISTORY_SUMMARY` | `true` | Advertise Auggie's history-summarization flags so long sessions compact instead of overflowing |
+| `AUGGIE_LAUNCH_HISTORY_SUMMARY_TRIGGER_TOKENS` | `120000` | Compact the session once the conversation reaches this many tokens |
+| `AUGGIE_LAUNCH_HISTORY_SUMMARY_MAX_HISTORY_CHARS` | `100000` | Cap on the verbatim history kept alongside the summary |
 | `AUGGIE_LAUNCH_VERBOSE` | `0` | Enable verbose diagnostic logging |
 | `AUGGIE_LAUNCH_REQUIRE_LOCAL_TOKEN` | `true` | Reject local requests without the token injected into Auggie |
 | `AUGGIE_LAUNCH_LOCAL_TOKEN` | random per session | Pin the local proxy token instead of generating one |
+
+### CodeGPT Plus Settings
+CodeGPT Plus is auto-detected when `AUGGIE_LAUNCH_BASE_URL` points at `api.codegpt.co`.
+Unlike a plain OpenAI upstream, CodeGPT routes every chat **through an agent** and
+authenticates with the session token the CodeGPT VS Code extension serves on
+`http://localhost:54112/api/session` (the extension must be running).
+
+| Variable | Default | Description |
+|---|---|---|
+| `AUGGIE_LAUNCH_CODEGPT_AGENT_ID` | — | Agent that handles the chat (create one in the CodeGPT panel) |
+| `AUGGIE_LAUNCH_CODEGPT_TOKEN` | — | Pin the session token so VS Code need not be open (long-lived) |
+| `AUGGIE_LAUNCH_CODEGPT_SESSION_URL` | `http://localhost:54112/api/session` | Where the live session token is read from; set empty to disable probing |
+| `AUGGIE_LAUNCH_CODEGPT_ORG_ID` | from session | Organization id sent as `CodeGPT-Org-Id` |
+| `AUGGIE_LAUNCH_CODEGPT_DISTINCT_ID` | from session | Override the `distinct-id` header |
+| `AUGGIE_LAUNCH_CODEGPT_SIGNED_DISTINCT_ID` | from session | Override the `X-Signed-Distinct-Id` header |
+| `AUGGIE_LAUNCH_CODEGPT_VERSION` | `3.24.70` | `codegpt-version` header value |
+| `AUGGIE_LAUNCH_FORCE_CODEGPT` | `false` | Force CodeGPT mode even if the URL differs |
+
+Plain chats go to `/chat/extension`; requests that carry tools go to `/chat/tools`.
+Both return an OpenAI-shaped SSE stream, so Auggie sees no difference.
 
 ---
 

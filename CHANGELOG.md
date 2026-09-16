@@ -4,6 +4,46 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- CodeGPT Plus upstream (`auggie_launch/codegpt.py`): auto-detected on
+  `api.codegpt.co`, it mints a fresh session token from the CodeGPT VS Code
+  extension, routes plain chats to `/chat/extension` and tool calls to
+  `/chat/tools`, and rewrites OpenAI tools/`agentId` into the agent request shape.
+- CodeGPT Plus models surfaced to Auggie from the extension's local DB
+  (`codegpt_model_ids`), with a static plan fallback.
+- `AUGGIE_LAUNCH_UPSTREAM_TIMEOUT` to configure the upstream request timeout
+  (default `300` seconds) instead of the hard-coded value.
+
+### Added
+- Session compaction: the proxy advertises Auggie's history-summarization
+  feature flags (`history_summary_min_version`, `history_summary_params`), so a
+  long session is summarized instead of overflowing the upstream window
+  (`AUGGIE_LAUNCH_HISTORY_SUMMARY*`).
+
+### Fixed
+- Tool messages are no longer passed to CodeGPT as OpenAI `tool` turns: Vertex
+  rejects them with "number of function response parts is not equal to the
+  number of function call parts", so tool results and assistant `tool_calls` are
+  folded into plain user/assistant text.
+- Parallel tool calls whose deltas all share `index: 0` (CodeGPT restarts the
+  index per call) are kept separate instead of being concatenated into invalid
+  JSON arguments.
+- Streaming deltas no longer duplicate the assistant text: each chunk carries
+  only `delta`, not the same text under both `text` and `delta`.
+- CodeGPT/Vertex compatibility: conversations ending on an assistant turn are
+  nudged with a user message (Vertex rejects "Requests ending with a model
+  turn"), and integer `enum` members in tool schemas are coerced to strings.
+- The `/model` picker no longer crashes: every registry entry now carries
+  `displayName`/`shortName` as Auggie's menu requires.
+- 9router combos/aliases are hidden when 9router is not the upstream.
+
+### Changed
+- Debug request dumps in the proxy are now written by a single
+  `dump_debug_request` helper instead of two duplicated blocks.
+- `/token`-suffixed paths no longer bypass local-token authorization.
+
 ## [0.4.0] - 2026-09-03
 
 ### Added

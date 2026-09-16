@@ -23,6 +23,16 @@ from .upstream import compact_upstream_error, json_bytes, open_upstream_with_ret
 # Local Auggie Proxy Server
 # ============================================================================
 
+def dump_debug_request(body: Any, openai_request: dict[str, Any]) -> None:
+    """Write incoming/outgoing payloads to the debug dir when verbose mode is on."""
+    if not config.VERBOSE:
+        return
+    os.makedirs(config.DEBUG_DIR, exist_ok=True)
+    for name, value in (("incoming_augment_request.json", body), ("outgoing_openai_request.json", openai_request)):
+        with open(os.path.join(config.DEBUG_DIR, name), "w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, indent=2)
+
+
 def read_json(handler: BaseHTTPRequestHandler) -> Any:
     length = int(handler.headers.get("content-length") or "0")
     if length <= 0:
@@ -157,7 +167,7 @@ class AuggieProxy(BaseHTTPRequestHandler):
         """
         if not config.REQUIRE_LOCAL_TOKEN:
             return True
-        if path in {"", "health"} or path in {"token", "auth/token"} or path.endswith("/token"):
+        if path in {"", "health"} or path in {"token", "auth/token"}:
             return True
         header = self.headers.get("Authorization") or self.headers.get("authorization") or ""
         presented = header[7:].strip() if header.lower().startswith("bearer ") else header.strip()
@@ -202,7 +212,7 @@ class AuggieProxy(BaseHTTPRequestHandler):
         if config.VERBOSE:
             log(f"{self.command} /{path}")
 
-        if path in {"token", "auth/token"} or path.endswith("/token"):
+        if path in {"token", "auth/token"}:
             self.send_json(fake_token())
             return
         if path in {"get-models", "models", "model-config"}:
@@ -230,14 +240,9 @@ class AuggieProxy(BaseHTTPRequestHandler):
 
     def forward_json(self, body: Any) -> None:
         openai_request = build_openai_request(body, stream=False)
-        if config.VERBOSE:
-            os.makedirs(config.DEBUG_DIR, exist_ok=True)
-            with open(os.path.join(config.DEBUG_DIR, "incoming_augment_request.json"), "w", encoding="utf-8") as f:
-                json.dump(body, f, ensure_ascii=False, indent=2)
-            with open(os.path.join(config.DEBUG_DIR, "outgoing_openai_request.json"), "w", encoding="utf-8") as f:
-                json.dump(openai_request, f, ensure_ascii=False, indent=2)
+        dump_debug_request(body, openai_request)
         try:
-            with open_upstream_with_retries(json_bytes(openai_request), stream=False, timeout=300, label="json") as resp:
+            with open_upstream_with_retries(json_bytes(openai_request), stream=False, timeout=int(config.UPSTREAM_TIMEOUT_SECONDS), label="json") as resp:
                 raw = resp.read()
             data = json.loads(raw.decode("utf-8") or "{}")
             text = extract_chat_text(data)
@@ -256,15 +261,12 @@ class AuggieProxy(BaseHTTPRequestHandler):
 
     def forward_stream(self, body: Any) -> None:
         openai_request = build_openai_request(body, stream=True)
+        dump_debug_request(body, openai_request)
         if config.VERBOSE:
-            os.makedirs(config.DEBUG_DIR, exist_ok=True)
-            with open(os.path.join(config.DEBUG_DIR, "incoming_augment_request.json"), "w", encoding="utf-8") as f:
-                json.dump(body, f, ensure_ascii=False, indent=2)
-            with open(os.path.join(config.DEBUG_DIR, "outgoing_openai_request.json"), "w", encoding="utf-8") as f:
-                json.dump(openai_request, f, ensure_ascii=False, indent=2)
+            log(f"stream payload: {len(json_bytes(openai_request))} bytes, {len(openai_request.get('messages', []))} messages, {len(openai_request.get('tools') or [])} tools")
         request_id = str(uuid.uuid4())
         try:
-            upstream_wrapper = open_upstream_with_retries(json_bytes(openai_request), stream=True, timeout=300, label="stream")
+            upstream_wrapper = open_upstream_with_retries(json_bytes(openai_request), stream=True, timeout=int(config.UPSTREAM_TIMEOUT_SECONDS), label="stream")
         except urllib.error.HTTPError as exc:
             msg = compact_upstream_error(exc.msg, max_chars=2000)
             self.send_json({"error": "upstream_error", "message": msg, "status": exc.code, "request_id": request_id}, status=502 if exc.code in {401, 403} else exc.code)
@@ -356,28 +358,28 @@ class AuggieProxy(BaseHTTPRequestHandler):
                         if config.STREAM_THINKING:
                             if not in_thinking_block:
                                 in_thinking_block = True
-                                write_chunk({"text": "<think>\n", "delta": "<think>\n", "request_id": request_id})
+                                write_chunk({"delta": "<think>\n", "request_id": request_id})
                                 accumulated.append("<think>\n")
                             accumulated.append(reasoning_text)
-                            write_chunk({"text": reasoning_text, "delta": reasoning_text, "request_id": request_id})
+                            write_chunk({"delta": reasoning_text, "request_id": request_id})
                         else:
                             write_chunk({"text": "", "heartbeat": True, "thinking": True, "request_id": request_id})
 
                     if delta_text:
                         if in_thinking_block:
                             in_thinking_block = False
-                            write_chunk({"text": "\n</think>\n\n", "delta": "\n</think>\n\n", "request_id": request_id})
+                            write_chunk({"delta": "\n</think>\n\n", "request_id": request_id})
                             accumulated.append("\n</think>\n\n")
 
                         accumulated.append(delta_text)
-                        write_chunk({"text": delta_text, "delta": delta_text, "request_id": request_id})
+                        write_chunk({"delta": delta_text, "request_id": request_id})
 
         except Exception as exc:
             if not client_disconnected:
                 write_chunk({"error": "upstream_error", "message": compact_upstream_error(str(exc)), "request_id": request_id})
         finally:
             if in_thinking_block and not client_disconnected:
-                write_chunk({"text": "\n</think>\n\n", "delta": "\n</think>\n\n", "request_id": request_id})
+                write_chunk({"delta": "\n</think>\n\n", "request_id": request_id})
                 accumulated.append("\n</think>\n\n")
 
             if not client_disconnected:

@@ -649,3 +649,199 @@ class TestLocalProxyAuthorization(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestCodeGPTGeminiCompat(unittest.TestCase):
+    """CodeGPT routes through Vertex/Gemini, which rejects two shapes OpenAI allows:
+    non-string enum members and a conversation ending on an assistant turn."""
+
+    def test_gemini_safe_schema_coerces_integer_enum(self):
+        schema = {"type": "object", "properties": {"verbosity": {"type": "integer", "enum": [1, 2, 3]}}}
+        safe = main.codegpt.gemini_safe_schema(schema)
+        verbosity = safe["properties"]["verbosity"]
+        self.assertEqual(verbosity["enum"], ["1", "2", "3"])
+        self.assertEqual(verbosity["type"], "string")
+
+    def test_gemini_safe_schema_keeps_string_enum(self):
+        schema = {"type": "string", "enum": ["a", "b"]}
+        self.assertEqual(main.codegpt.gemini_safe_schema(schema), {"type": "string", "enum": ["a", "b"]})
+
+    def test_gemini_safe_messages_appends_user_after_assistant(self):
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        fixed = main.codegpt.gemini_safe_messages(msgs)
+        self.assertEqual(fixed[-1]["role"], "user")
+        self.assertEqual(len(fixed), 3)
+
+    def test_gemini_safe_messages_handles_repeated_assistant_tail(self):
+        msgs = [{"role": "assistant", "content": "a"}, {"role": "assistant", "content": "b"}]
+        fixed = main.codegpt.gemini_safe_messages(msgs)
+        self.assertEqual(fixed[-1]["role"], "user")
+
+    def test_gemini_safe_messages_leaves_user_tail_untouched(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        self.assertEqual(main.codegpt.gemini_safe_messages(msgs), msgs)
+
+    def test_gemini_safe_messages_empty_input(self):
+        fixed = main.codegpt.gemini_safe_messages([])
+        self.assertEqual(fixed[0]["role"], "user")
+
+    def test_adapt_request_body_flattens_and_sanitises_tools(self):
+        request = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "calc",
+                    "description": "calculate",
+                    "parameters": {"type": "object", "properties": {"mode": {"enum": [1, 2]}}},
+                },
+            }],
+        }
+        with patch("auggie_launch.config.CODEGPT_AGENT_ID", "agent-123"):
+            body = main.codegpt.adapt_request_body(request)
+        self.assertEqual(body["agentId"], "agent-123")
+        tool = body["tools"][0]
+        self.assertEqual(tool["name"], "calc")
+        self.assertNotIn("function", tool)
+        self.assertEqual(tool["parameters"]["properties"]["mode"]["enum"], ["1", "2"])
+
+
+class TestRegistryModelPicker(unittest.TestCase):
+    """Auggie's /model menu reads displayName/shortName from the registry and
+    crashes when they are absent."""
+
+    def test_every_registry_entry_has_picker_fields(self):
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False):
+            payload = main.registry.fake_models()
+        registry = json.loads(payload["feature_flags"]["model_info_registry"])
+        self.assertTrue(registry)
+        for name, entry in registry.items():
+            self.assertTrue(entry.get("displayName"), f"{name} missing displayName")
+            self.assertTrue(entry.get("shortName"), f"{name} missing shortName")
+
+    def test_default_model_is_in_registry(self):
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False):
+            payload = main.registry.fake_models()
+        registry = json.loads(payload["feature_flags"]["model_info_registry"])
+        self.assertIn(payload["default_model"], registry)
+
+    def test_9router_models_hidden_when_not_9router(self):
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False), \
+             patch("auggie_launch.config.IS_9ROUTER", False), \
+             patch.object(main.config._LOCAL_9ROUTER, "combos", [{"name": "some-combo", "models": ["a"]}]), \
+             patch.object(main.config._LOCAL_9ROUTER, "model_aliases", {"some-alias": "a"}):
+            names = {m["name"] for m in main.registry.fake_models()["models"]}
+        self.assertNotIn("some-combo", names)
+        self.assertNotIn("some-alias", names)
+
+    def test_9router_models_shown_when_9router(self):
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False), \
+             patch("auggie_launch.config.IS_9ROUTER", True), \
+             patch.object(main.config._LOCAL_9ROUTER, "combos", [{"name": "some-combo", "models": ["a"]}]), \
+             patch.object(main.config._LOCAL_9ROUTER, "model_aliases", {"some-alias": "a"}):
+            names = {m["name"] for m in main.registry.fake_models()["models"]}
+        self.assertIn("some-combo", names)
+        self.assertIn("some-alias", names)
+
+
+
+class TestHistorySummarization(unittest.TestCase):
+    """Auggie only compacts a long session when the proxy advertises the
+    history-summary feature flags; without them the history grows unbounded."""
+
+    def test_summary_flags_present_and_enabled(self):
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False), \
+             patch("auggie_launch.config.HISTORY_SUMMARY_ENABLED", True), \
+             patch("auggie_launch.config.HISTORY_SUMMARY_MIN_VERSION", "0.0.1"):
+            ff = main.registry.fake_models()["feature_flags"]
+        self.assertEqual(ff["history_summary_min_version"], "0.0.1")
+        params = json.loads(ff["history_summary_params"])
+        self.assertIn("trigger_on_total_tokens", params)
+        self.assertIn("max_history_chars", params)
+        self.assertGreater(params["trigger_on_total_tokens"], 0)
+
+    def test_summary_min_version_empty_when_disabled(self):
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False), \
+             patch("auggie_launch.config.HISTORY_SUMMARY_ENABLED", False):
+            ff = main.registry.fake_models()["feature_flags"]
+        # An empty min version is how Auggie decides summarization is off.
+        self.assertEqual(ff["history_summary_min_version"], "")
+
+    def test_history_summary_params_is_valid_json(self):
+        params = json.loads(main.registry.history_summary_params())
+        self.assertEqual(sorted(params), ["input_budget_trigger_ratio", "max_history_chars", "trigger_on_total_tokens"])
+
+
+
+class TestGeminiToolMessageFolding(unittest.TestCase):
+    """Vertex rejects OpenAI-style tool turns ("number of function response parts
+    is not equal to the number of function call parts"), so the proxy folds
+    `role: tool` results and assistant tool_calls into plain user/assistant text."""
+
+    def test_tool_messages_become_user_text(self):
+        msgs = [
+            {"role": "user", "content": "read files"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "view", "arguments": '{"path":"a.py"}'}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "file a content"},
+        ]
+        out = main.codegpt.gemini_safe_messages(msgs)
+        self.assertFalse(any(m.get("role") == "tool" for m in out))
+        self.assertFalse(any(m.get("tool_calls") for m in out))
+        joined = " ".join(str(m.get("content") or "") for m in out)
+        self.assertIn("file a content", joined)
+        self.assertIn("view", joined)
+
+    def test_parallel_tool_calls_are_preserved_as_text(self):
+        msgs = [
+            {"role": "user", "content": "read both"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "view", "arguments": '{"path":"a.py"}'}},
+                {"id": "c2", "type": "function", "function": {"name": "view", "arguments": '{"path":"b.py"}'}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "A"},
+            {"role": "tool", "tool_call_id": "c2", "content": "B"},
+        ]
+        out = main.codegpt.gemini_safe_messages(msgs)
+        joined = " ".join(str(m.get("content") or "") for m in out)
+        self.assertIn("a.py", joined)
+        self.assertIn("b.py", joined)
+        self.assertIn("A", joined)
+        self.assertIn("B", joined)
+
+    def test_no_two_consecutive_same_role_from_folding(self):
+        msgs = [
+            {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+            {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+            {"role": "user", "content": "next"},
+        ]
+        out = main.codegpt.gemini_safe_messages(msgs)
+        roles = [m.get("role") for m in out]
+        self.assertEqual(roles, ["user", "user"])
+        self.assertEqual(out[0]["content"], "[tool result] r1\n[tool result] r2")
+
+
+class TestParallelToolCallMerge(unittest.TestCase):
+    """CodeGPT restarts the delta index at 0 for parallel calls; merging purely by
+    index concatenates their arguments into invalid JSON."""
+
+    def test_distinct_ids_on_same_index_stay_separate(self):
+        deltas = [
+            {"index": 0, "id": "aaa", "function": {"name": "view", "arguments": '{"path":"a.py"}'}},
+            {"index": 0, "id": "bbb", "function": {"name": "view", "arguments": '{"path":"b.py"}'}},
+        ]
+        merged = main.truncation.merge_stream_tool_calls(deltas)
+        self.assertEqual(len(merged), 2)
+        for call in merged:
+            json.loads(call["function"]["arguments"])  # must be valid JSON
+
+    def test_fragments_of_one_call_still_merge(self):
+        deltas = [
+            {"index": 0, "id": "same", "function": {"name": "view", "arguments": '{"pa'}},
+            {"index": 0, "id": "same", "function": {"name": "", "arguments": 'th":"a.py"}'}},
+        ]
+        merged = main.truncation.merge_stream_tool_calls(deltas)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(json.loads(merged[0]["function"]["arguments"]), {"path": "a.py"})
