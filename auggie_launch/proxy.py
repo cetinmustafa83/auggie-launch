@@ -95,6 +95,46 @@ def augment_usage(openai_request: dict[str, Any], usage: Any) -> dict[str, int]:
     }
 
 
+def resolve_tool_calls(openai_request: dict[str, Any], tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rewrites tool names the model invented onto the tools Auggie actually has.
+
+    Streaming deltas are forwarded as they arrive, but the model may emit an
+    invented name (e.g. `grep_search`). Auggie would answer "Tool not found" and
+    the turn would be wasted, so names are resolved before they reach it.
+    """
+    if not config.IS_CODEGPT or not tool_calls:
+        return tool_calls
+    from . import codegpt
+
+    available: set[str] = set()
+    for tool in openai_request.get("tools") or []:
+        if isinstance(tool, dict):
+            fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            name = fn.get("name")
+            if isinstance(name, str):
+                available.add(name)
+    if not available:
+        return tool_calls
+
+    resolved: list[dict[str, Any]] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function")
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            args = codegpt._coerce_arguments(fn.get("arguments"))
+            name, shaped = codegpt.route_tool_call(fn["name"], args, available)
+            if name != fn["name"]:
+                log(f"tool remap: {fn['name']} -> {name}")
+            fn = dict(fn)
+            fn["name"] = name
+            if shaped != args:
+                fn["arguments"] = json.dumps(shaped, ensure_ascii=False)
+            call = {**call, "function": fn}
+        resolved.append(call)
+    return resolved
+
+
 def augment_chat_response(text: str, request_id: str, openai_request: dict[str, Any], usage: Any, tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     token_usage = augment_usage(openai_request, usage)
     basic_usage = estimate_usage(openai_request, usage)
@@ -384,7 +424,8 @@ class AuggieProxy(BaseHTTPRequestHandler):
 
             if not client_disconnected:
                 final_text = "".join(accumulated)
-                final = augment_chat_response(final_text, request_id, openai_request, usage, tool_calls)
+                merged_calls = resolve_tool_calls(openai_request, tool_calls)
+                final = augment_chat_response(final_text, request_id, openai_request, usage, merged_calls)
                 final["done"] = True
                 write_chunk(final)
                 try:

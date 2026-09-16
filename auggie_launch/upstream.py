@@ -37,6 +37,19 @@ class ConnectionPool:
             while pool:
                 conn, last_used = pool.pop()
                 if (now - last_used) <= self._max_idle and conn.sock is not None:
+                    # A pooled connection keeps the timeout it was created with;
+                    # refresh it so a later, longer-lived request is not cut off
+                    # by an earlier short timeout (and vice versa).
+                    try:
+                        if conn.sock is not None:
+                            conn.sock.settimeout(timeout)
+                        conn.timeout = timeout
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        continue
                     return conn
                 try:
                     conn.close()

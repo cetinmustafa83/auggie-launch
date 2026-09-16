@@ -28,6 +28,25 @@ def provider_key(name: str) -> str:
     return str(config._LOCAL_9ROUTER.provider_api_keys.get(name) or "").strip()
 
 
+def mcp_command(bin_name: str, npx_package: str) -> dict[str, Any]:
+    """Prefers an installed binary over `npx`.
+
+    `npx -y pkg@latest` re-resolves the package on every launch, which takes
+    ~25s here -- well past Auggie's 10s MCP startup window, so the server is
+    reported as failed on every run. A global install starts immediately; npx
+    stays as the fallback, with the cached copy preferred over the network.
+    """
+    home = os.path.expanduser("~")
+    for candidate in (
+        os.path.join(home, ".npm-global", "bin", bin_name),
+        os.path.join("/usr", "local", "bin", bin_name),
+        os.path.join(home, ".local", "bin", bin_name),
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return {"command": candidate, "args": []}
+    return {"command": "npx", "args": ["-y", "--prefer-offline", npx_package]}
+
+
 def generate_injected_mcp_config() -> str:
     """Generates an MCP configuration file for Auggie CLI with 9router's tools."""
     home = os.path.expanduser("~")
@@ -48,8 +67,7 @@ def generate_injected_mcp_config() -> str:
     tavily_key = provider_key("tavily")
     if tavily_key:
         mcp_servers["tavily"] = {
-            "command": "npx",
-            "args": ["-y", "tavily-mcp@latest"],
+            **mcp_command("tavily-mcp", "tavily-mcp@latest"),
             "env": {"TAVILY_API_KEY": tavily_key},
         }
 
@@ -57,8 +75,7 @@ def generate_injected_mcp_config() -> str:
     exa_key = provider_key("exa")
     if exa_key:
         mcp_servers["exa"] = {
-            "command": "npx",
-            "args": ["-y", "exa-mcp-server"],
+            **mcp_command("exa-mcp-server", "exa-mcp-server"),
             "env": {"EXA_API_KEY": exa_key},
         }
 

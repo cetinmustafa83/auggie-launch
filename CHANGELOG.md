@@ -7,6 +7,8 @@ and the project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `AUGGIE_LAUNCH_REPLY_LANGUAGE` to pin replies to one language; upstreams
+  otherwise drifted into an arbitrary language mid-answer.
 - CodeGPT Plus upstream (`auggie_launch/codegpt.py`): auto-detected on
   `api.codegpt.co`, it mints a fresh session token from the CodeGPT VS Code
   extension, routes plain chats to `/chat/extension` and tool calls to
@@ -23,6 +25,18 @@ and the project uses [Semantic Versioning](https://semver.org/).
   (`AUGGIE_LAUNCH_HISTORY_SUMMARY*`).
 
 ### Fixed
+- Timeouts: pooled HTTP connections kept the timeout of whichever request
+  created them, so a short-lived call capped a later long one. The socket
+  timeout is now refreshed on acquire.
+- Timeouts: `npx -y <pkg>@latest` re-resolved on every launch (~25s), blowing
+  past Auggie's 10s MCP window, so MCP servers failed on every run. An installed
+  binary is used when present, with `npx --prefer-offline` as the fallback.
+- Timeouts: `completion_timeout_ms` advertised to Auggie (600s) exceeded the
+  proxy's own upstream cutoff (300s); it is now derived from that timeout.
+- Search routing no longer targets `codebase-retrieval`: it is served by
+  Auggie's `/agents` endpoint, which the proxy only stubs, so searches returned
+  nothing and the model retried until it crashed. Searches now resolve to a real
+  `grep`/`ls` via `launch-process` (patterns shell-quoted).
 - Invented tool names (`file_search`, `read_file`, `bash`, ...) are remapped onto
   the real Auggie tool before the turn is replayed, instead of failing with
   "Tool X not found" and derailing the conversation.

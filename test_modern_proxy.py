@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Comprehensive unit and offline test suite for auggie-launch modern LLM & 9router proxy techniques."""
 
+import itertools
 import json
 import os
 import shutil
@@ -819,8 +820,8 @@ class TestGeminiToolMessageFolding(unittest.TestCase):
         ]
         out = main.codegpt.gemini_safe_messages(msgs)
         roles = [m.get("role") for m in out]
-        self.assertEqual(roles, ["user", "user"])
-        self.assertEqual(out[0]["content"], "(tool output on record: r1)\n(tool output on record: r2)")
+        self.assertEqual(roles, ["user"])
+        self.assertEqual(out[0]["content"], "[Tool result: r1]\n[Tool result: r2]\nnext")
 
 
 class TestParallelToolCallMerge(unittest.TestCase):
@@ -863,8 +864,6 @@ class TestToolNameAliases(unittest.TestCase):
 
     def test_invented_names_map_to_real_tools(self):
         cases = {
-            "file_search": "codebase-retrieval",
-            "grep": "codebase-retrieval",
             "read_file": "view",
             "bash": "launch-process",
             "write_file": "save-file",
@@ -894,11 +893,138 @@ class TestToolNameAliases(unittest.TestCase):
                 {"role": "tool", "tool_call_id": "c1", "content": "hits"},
             ],
             "tools": [{"type": "function", "function": {
-                "name": "codebase-retrieval", "description": "x",
+                "name": "launch-process", "description": "x",
                 "parameters": {"type": "object", "properties": {}},
             }}],
         }
         body = main.codegpt.adapt_request_body(request)
         joined = " ".join(str(m.get("content") or "") for m in body["messages"])
-        self.assertIn("codebase-retrieval", joined)
+        self.assertIn("launch-process", joined)
         self.assertNotIn("file_search", joined)
+
+
+
+class TestFileSearchRouting(unittest.TestCase):
+    """`file_search` must resolve to a tool the proxy can actually serve.
+
+    The tempting target, `codebase-retrieval`, is served by Auggie's own
+    /agents endpoint which the proxy only stubs out; routing searches there made
+    the model read an empty result, retry forever and eventually crash on a
+    malformed call. Searches now resolve to real, locally executable tools.
+    """
+
+    AVAILABLE = frozenset({
+        "view", "save-file", "str-replace-editor", "launch-process",
+        "web-fetch", "remove-files", "tavily_search_tavily",
+    })
+
+    def route(self, name, args):
+        return main.codegpt.route_tool_call(name, args, self.AVAILABLE)
+
+    def test_search_routes_to_a_locally_runnable_tool(self):
+        for name, args in [
+            ("file_search", {"pattern": r"def func_0_5\("}),
+            ("grep_search", {"pattern": "TODO"}),
+            ("file_search", {"query": "where is auth"}),
+            ("file_search", {"glob": "**/*.py"}),
+        ]:
+            resolved, _ = self.route(name, args)
+            self.assertIn(resolved, self.AVAILABLE, (name, args))
+            self.assertNotEqual(resolved, "codebase-retrieval")
+
+    def test_regex_pattern_becomes_a_real_grep(self):
+        name, args = self.route("grep_search", {"pattern": "func_0_5"})
+        self.assertEqual(name, "launch-process")
+        self.assertIn("grep -rn", args["command"])
+        self.assertIn("func_0_5", args["command"])
+
+    def test_search_without_pattern_lists_the_scope(self):
+        name, args = self.route("file_search", {"query": "what is in here"})
+        self.assertEqual(name, "launch-process")
+        self.assertIn("ls -la", args["command"])
+
+    def test_explicit_file_plus_pattern_uses_view(self):
+        name, args = self.route("file_search", {"pattern": "x", "path": "module_0.py"})
+        self.assertEqual(name, "view")
+        self.assertEqual(args["path"], "module_0.py")
+
+    def test_shell_metacharacters_in_pattern_are_quoted(self):
+        _name, args = self.route("grep_search", {"pattern": "a; rm -rf /"})
+        self.assertIn("'a; rm -rf /'", args["command"])
+
+    def test_unknown_tool_is_not_rewritten_to_a_missing_tool(self):
+        name, _ = main.codegpt.route_tool_call("file_search", {"query": "x"}, {"view"})
+        self.assertNotEqual(name, "codebase-retrieval")
+
+
+
+class TestTimeoutConsistency(unittest.TestCase):
+    """Three separate deadlines must line up: the pooled socket timeout, the
+    proxy's upstream cutoff, and the deadline Auggie is told about."""
+
+    def test_pooled_connection_adopts_latest_timeout(self):
+        import urllib.parse
+
+        from auggie_launch.upstream import ConnectionPool
+        pool = ConnectionPool(max_idle_seconds=60.0)
+        url = urllib.parse.urlparse("https://example.invalid/v1")
+        first = pool.acquire(url, timeout=5.0)
+        self.assertEqual(first.timeout, 5.0)
+        pool.release(url, first, reusable=True)
+        second = pool.acquire(url, timeout=120.0)
+        self.assertEqual(second.timeout, 120.0)
+        if second.sock is not None:
+            self.assertEqual(second.sock.gettimeout(), 120.0)
+
+    def test_auggie_deadline_is_below_proxy_cutoff(self):
+        with patch("auggie_launch.config.UPSTREAM_TIMEOUT_SECONDS", 300.0):
+            entry = main.registry.model_list_entry("m", 100000)
+        self.assertLess(entry["completion_timeout_ms"] / 1000, 300.0)
+
+
+class TestReplyLanguage(unittest.TestCase):
+    def test_language_rule_added_when_set(self):
+        with patch("auggie_launch.config.REPLY_LANGUAGE", "English"):
+            prompt = main.transform.build_system_prompt()
+        self.assertIn("English", prompt)
+
+    def test_no_language_rule_when_unset(self):
+        with patch("auggie_launch.config.REPLY_LANGUAGE", ""):
+            prompt = main.transform.build_system_prompt()
+        self.assertNotIn("Always write your answers", prompt)
+
+    def test_auto_is_treated_as_unset(self):
+        with patch("auggie_launch.config.REPLY_LANGUAGE", "auto"):
+            prompt = main.transform.build_system_prompt()
+        self.assertNotIn("Always write your answers", prompt)
+
+
+class TestConsecutiveRoleCollapse(unittest.TestCase):
+    """Vertex merges consecutive same-role turns, which previously produced a
+    stalled stream when a tool-only assistant turn was dropped."""
+
+    def test_tool_only_assistant_turn_kept(self):
+        msgs = [
+            {"role": "user", "content": "search"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "view", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "hit"},
+            {"role": "user", "content": "next"},
+        ]
+        out = main.codegpt.gemini_safe_messages(msgs)
+        roles = [m["role"] for m in out]
+        self.assertEqual(roles, ["user", "assistant", "user"])
+        self.assertEqual(roles[-1], "user")
+
+    def test_no_consecutive_same_role_after_folding(self):
+        msgs = [
+            {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+            {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+            {"role": "user", "content": "u1"},
+            {"role": "user", "content": "u2"},
+        ]
+        out = main.codegpt.gemini_safe_messages(msgs)
+        roles = [m["role"] for m in out]
+        for a, b in itertools.pairwise(roles):
+            self.assertNotEqual(a, b)

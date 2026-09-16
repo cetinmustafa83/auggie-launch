@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -151,7 +152,7 @@ def _flatten_tool_calls(tool_calls: Any) -> str:
             fn = call.get("function") if isinstance(call.get("function"), dict) else {}
             name = fn.get("name") or call.get("name") or "tool"
             args = fn.get("arguments") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments") or {})
-            lines.append(f"(tool invocation on record: {name} {args})")
+            lines.append(f"[Earlier tool call: {name} with arguments {args}]")
     return "\n".join(lines)
 
 
@@ -190,20 +191,22 @@ def gemini_safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
             content = msg.get("content")
             if isinstance(content, list):
                 content = text_from_value(content)
-            pending.append(f"(tool output on record: {content if content is not None else ''})")
+            pending.append(f"[Tool result: {content if content is not None else ''}]")
             continue
         if role in {"assistant", "model"}:
             calls = _flatten_tool_calls(msg.get("tool_calls"))
             text = msg.get("content")
             if isinstance(text, list):
                 text = text_from_value(text)
-            combined = "\n".join(part for part in (text or "", calls) if part).strip()
-            if combined:
-                flush_pending()
-                out.append({"role": "assistant", "content": combined})
-            elif not calls:
-                flush_pending()
-                out.append({"role": "assistant", "content": text or ""})
+            flush_pending()
+            # Keep the assistant turn even when it only carried tool_calls;
+            # dropping it leaves consecutive user turns, which Vertex rejects.
+            out.append({"role": "assistant", "content": text or "(working)"})
+            if calls:
+                # Reported as incoming information rather than as the model's own
+                # output: a model imitates its previous turns, so an emulated
+                # call syntax would be parroted back to the user.
+                pending.append(calls)
             continue
         flush_pending()
         text = msg.get("content")
@@ -211,6 +214,16 @@ def gemini_safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
             text = text_from_value(text)
         out.append({"role": role or "user", "content": text if text is not None else ""})
     flush_pending()
+
+    # Collapse any run of same-role turns: Vertex treats them as one turn.
+    collapsed: list[dict[str, Any]] = []
+    for msg in out:
+        if collapsed and collapsed[-1]["role"] == msg["role"]:
+            merged = "\n".join(p for p in (str(collapsed[-1].get("content") or ""), str(msg.get("content") or "")) if p)
+            collapsed[-1] = {"role": msg["role"], "content": merged}
+        else:
+            collapsed.append(msg)
+    out = collapsed
 
     if not out:
         return [{"role": "user", "content": "(empty request)"}]
@@ -221,37 +234,178 @@ def gemini_safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 # Models routinely invent tool names from their training data (`file_search`,
 # `read_file`, `bash`). Auggie only knows its own names, so an invented call
-# fails with "Tool X not found" and derails the turn. Unknown names that match a
-# known tool's job are remapped onto the real one.
+# fails with "Tool X not found" and derails the turn.
+#
+# `file_search` is deliberately absent from this table: it genuinely can mean
+# either a regex scan over files or a semantic lookup in Auggie's codebase
+# index. Which one is meant is decided from the arguments, in `route_tool_call`.
 _TOOL_ALIASES = {
-    "file_search": "codebase-retrieval",
-    "search_files": "codebase-retrieval",
-    "grep_search": "codebase-retrieval",
-    "grep": "codebase-retrieval",
-    "search": "codebase-retrieval",
-    "code_search": "codebase-retrieval",
-    "read_file": "view",
+    # file reading / listing
     "read": "view",
+    "read_file": "view",
+    "readfile": "view",
     "open_file": "view",
     "cat": "view",
+    "view_file": "view",
+    "get_file": "view",
     "list_files": "view",
+    "list_dir": "view",
+    "list_directory": "view",
     "ls": "view",
+    "dir": "view",
+    "glob": "view",
+    "glob_files": "view",
+    "find_files": "view",
+    # writing / editing
     "write_file": "save-file",
+    "write": "save-file",
     "create_file": "save-file",
+    "save_file": "save-file",
     "edit_file": "str-replace-editor",
     "str_replace": "str-replace-editor",
+    "strreplace": "str-replace-editor",
     "replace": "str-replace-editor",
+    "patch": "apply_patch",
+    "apply_patch": "apply_patch",
+    "edit": "str-replace-editor",
+    # shell / processes
     "bash": "launch-process",
     "shell": "launch-process",
+    "sh": "launch-process",
     "run_command": "launch-process",
     "execute_command": "launch-process",
+    "exec": "launch-process",
     "terminal": "launch-process",
+    "run": "launch-process",
+    # filesystem maintenance
+    "delete_file": "remove-files",
+    "delete_files": "remove-files",
+    "rm": "remove-files",
+    "remove_file": "remove-files",
+    "remove_files": "remove-files",
+    # web
     "web_search": "tavily_search_tavily",
+    "search_web": "tavily_search_tavily",
     "fetch": "web-fetch",
     "fetch_url": "web-fetch",
-    "delete_file": "remove-files",
-    "rm": "remove-files",
+    "http_get": "web-fetch",
+    "browse": "web-fetch",
+    # code intelligence / analysis (no direct Auggie equivalent: use the index)
+    "audit_workspace": "view",
+    "audit": "view",
+    "analyze_workspace": "view",
+    "analyze_repo": "view",
+    "analyze_code": "view",
+    "explore": "view",
+    "explore_repo": "view",
+    "understand_codebase": "view",
+    "code_search": "launch-process",
+    "search_code": "launch-process",
+    "find_symbol": "view",
+    "find_references": "view",
+    "get_diagnostics": "view",
+    # task tracking
+    "todo_write": "add_tasks",
+    "todowrite": "add_tasks",
+    "create_tasks": "add_tasks",
+    "update_tasks": "update_tasks",
+    "list_tasks": "view_tasklist",
+    "view_tasks": "view_tasklist",
 }
+
+# Keys that spell out a literal pattern mean a regex/glob scan, not a question.
+_REGEX_KEYS = ("pattern", "regex", "regex_pattern", "search_query_regex", "glob", "query_regex")
+# Keys that spell out a natural-language question mean semantic retrieval.
+_SEMANTIC_KEYS = ("information_request", "information_need", "description", "question", "intent", "semantic_query")
+
+
+def _coerce_arguments(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
+def _looks_like_regex(value: str) -> bool:
+    """A regex/glob hint: metacharacters that a plain question would not carry."""
+    if not value:
+        return False
+    if any(ch in value for ch in ("*", "^", "$", "|", "\\", "(", ")", "[", "]")):
+        return True
+    return bool(re.search(r"\S+\.\w{1,5}\b|\w+\s*[:=]", value))
+
+
+def shell_quote(value: str) -> str:
+    """Single-quotes a value for safe interpolation into a shell command."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def route_tool_call(name: str, args: dict[str, Any], available: set[str]) -> tuple[str, dict[str, Any]]:
+    """Chooses the real tool for an invented call and reshapes its arguments.
+
+    `file_search` is the interesting case: a `pattern`/`glob` argument asks for a
+    regex scan (Auggie's `view` with `search_query_regex`), while a plain question
+    asks for the semantic index (`codebase-retrieval`). Guessing wrong either
+    finds nothing or answers a different question, so the decision is made from
+    the arguments rather than a fixed mapping.
+    """
+    lowered = name.lower()
+    is_search = lowered in {"file_search", "search_files", "grep_search", "grep", "code_search", "search", "find_files", "find"}
+
+    if is_search and name not in available:
+        regex_hint = ""
+        for key in _REGEX_KEYS:
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                regex_hint = value.strip()
+                break
+        # Also catch a pattern hidden under an unexpected key, as long as it is
+        # not a natural-language question.
+        if not regex_hint and not any(isinstance(args.get(k), str) and args.get(k, "").strip() for k in _SEMANTIC_KEYS):
+            for value in args.values():
+                if isinstance(value, str) and _looks_like_regex(value):
+                    regex_hint = value.strip()
+                    break
+        semantic_present = any(isinstance(args.get(k), str) and args.get(k, "").strip() for k in _SEMANTIC_KEYS)
+        target = args.get("path") or args.get("file") or args.get("file_path") or args.get("directory")
+        # `view` can only regex-scan a single named file ("Optional parameter for
+        # files only"); a directory or a bare pattern must go through the index.
+        # Routing a recursive search at `view` made it fail on every turn, which
+        # is what sent the model into a retry loop.
+        file_level = isinstance(target, str) and target and not target.rstrip("/").endswith((".", "/"))
+
+        if regex_hint and file_level and "view" in available and not semantic_present:
+            shaped = {"path": target, "search_query_regex": regex_hint}
+            if isinstance(args.get("case_sensitive"), bool):
+                shaped["case_sensitive"] = args["case_sensitive"]
+            return "view", shaped
+
+        # A search must actually return matches. `view` only lists a directory,
+        # which the model reads as "nothing found" and retries forever, so the
+        # search is served by a real grep over the workspace.
+        if "launch-process" in available:
+            pattern = regex_hint or ""
+            scope = target if isinstance(target, str) and target and target not in {".", "./"} else "."
+            if pattern:
+                command = f"grep -rn -- {shell_quote(pattern)} {shell_quote(scope)}"
+            else:
+                command = f"ls -la {shell_quote(scope)}"
+            return "launch-process", {"command": command, "cwd": ".", "wait": True, "max_wait_seconds": 60}
+
+        if "view" in available:
+            shaped = {"path": ".", "type": "directory"}
+            return "view", shaped
+
+    mapped = _TOOL_ALIASES.get(lowered)
+    if mapped and mapped in available:
+        return mapped, args
+    return resolve_tool_name(name, available), args
 
 
 def resolve_tool_name(name: str, available: set[str]) -> str:
@@ -269,7 +423,7 @@ def resolve_tool_name(name: str, available: set[str]) -> str:
 
 
 def _normalize_tool_calls(msg: dict[str, Any], available: set[str]) -> None:
-    """Rewrites an assistant message's tool_call names in place."""
+    """Rewrites an assistant message's tool_call names (and arguments) in place."""
     calls = msg.get("tool_calls")
     if not isinstance(calls, list):
         return
@@ -277,8 +431,16 @@ def _normalize_tool_calls(msg: dict[str, Any], available: set[str]) -> None:
         if not isinstance(call, dict):
             continue
         fn = call.get("function")
-        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
-            fn["name"] = resolve_tool_name(fn["name"], available)
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+            continue
+        original = fn["name"]
+        if original in available:
+            continue
+        args = _coerce_arguments(fn.get("arguments"))
+        name, shaped = route_tool_call(original, args, available)
+        fn["name"] = name
+        if shaped != args:
+            fn["arguments"] = json.dumps(shaped, ensure_ascii=False)
 
 
 def adapt_request_body(request: dict[str, Any]) -> dict[str, Any]:

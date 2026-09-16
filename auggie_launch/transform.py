@@ -188,6 +188,15 @@ def build_system_prompt() -> str:
     if base_prompt:
         parts.append(base_prompt)
 
+    # Upstreams otherwise drift into an arbitrary language mid-answer (seen with
+    # the CodeGPT agent). Anchoring it keeps replies in the user's language.
+    language = (config.REPLY_LANGUAGE or "").strip()
+    if language and language.lower() not in {"keep", "auto", "same"}:
+        parts.append(
+            f"Always write your answers in {language}. "
+            "Use the same language the user writes in unless told otherwise."
+        )
+
     # Caveman mode is a 9router feature; it would only add noise on other upstreams.
     if config.ROUTER_CAVEMAN_MODE and config.IS_9ROUTER:
         if config.ROUTER_CAVEMAN_LEVEL == "ultra":

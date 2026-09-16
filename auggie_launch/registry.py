@@ -37,7 +37,9 @@ def model_list_entry(model_id: str, context_tokens: int) -> dict[str, Any]:
         "internal_name": model_id,
         "suggested_prefix_char_count": half_budget_chars,
         "suggested_suffix_char_count": half_budget_chars,
-        "completion_timeout_ms": 600000,
+        # Keep Auggie's own deadline under the proxy's upstream timeout, so it
+        # reports a clean timeout instead of a broken stream when we cut first.
+        "completion_timeout_ms": int(max(30.0, config.UPSTREAM_TIMEOUT_SECONDS - 30.0) * 1000),
     }
 
 
