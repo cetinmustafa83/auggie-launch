@@ -188,7 +188,8 @@ def build_system_prompt() -> str:
     if base_prompt:
         parts.append(base_prompt)
 
-    if config.ROUTER_CAVEMAN_MODE:
+    # Caveman mode is a 9router feature; it would only add noise on other upstreams.
+    if config.ROUTER_CAVEMAN_MODE and config.IS_9ROUTER:
         if config.ROUTER_CAVEMAN_LEVEL == "ultra":
             parts.append("Respond with maximum brevity. Output only working code and essential commands. Omit pleasantries, conversational intro/outro, and obvious explanations.")
         elif config.ROUTER_CAVEMAN_LEVEL == "lite":

@@ -23,6 +23,9 @@ and the project uses [Semantic Versioning](https://semver.org/).
   (`AUGGIE_LAUNCH_HISTORY_SUMMARY*`).
 
 ### Fixed
+- Invented tool names (`file_search`, `read_file`, `bash`, ...) are remapped onto
+  the real Auggie tool before the turn is replayed, instead of failing with
+  "Tool X not found" and derailing the conversation.
 - Tool messages are no longer passed to CodeGPT as OpenAI `tool` turns: Vertex
   rejects them with "number of function response parts is not equal to the
   number of function call parts", so tool results and assistant `tool_calls` are

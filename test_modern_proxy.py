@@ -820,7 +820,7 @@ class TestGeminiToolMessageFolding(unittest.TestCase):
         out = main.codegpt.gemini_safe_messages(msgs)
         roles = [m.get("role") for m in out]
         self.assertEqual(roles, ["user", "user"])
-        self.assertEqual(out[0]["content"], "[tool result] r1\n[tool result] r2")
+        self.assertEqual(out[0]["content"], "(tool output on record: r1)\n(tool output on record: r2)")
 
 
 class TestParallelToolCallMerge(unittest.TestCase):
@@ -845,3 +845,60 @@ class TestParallelToolCallMerge(unittest.TestCase):
         merged = main.truncation.merge_stream_tool_calls(deltas)
         self.assertEqual(len(merged), 1)
         self.assertEqual(json.loads(merged[0]["function"]["arguments"]), {"path": "a.py"})
+
+
+
+class TestToolNameAliases(unittest.TestCase):
+    """Models invent tool names from training data (`file_search`, `bash`).
+    Auggie only knows its own names, so invented calls are remapped."""
+
+    AVAILABLE = frozenset({
+        "codebase-retrieval", "view", "save-file", "str-replace-editor",
+        "launch-process", "web-fetch", "remove-files", "tavily_search_tavily",
+    })
+
+    def test_known_names_pass_through(self):
+        for name in self.AVAILABLE:
+            self.assertEqual(main.codegpt.resolve_tool_name(name, self.AVAILABLE), name)
+
+    def test_invented_names_map_to_real_tools(self):
+        cases = {
+            "file_search": "codebase-retrieval",
+            "grep": "codebase-retrieval",
+            "read_file": "view",
+            "bash": "launch-process",
+            "write_file": "save-file",
+            "edit_file": "str-replace-editor",
+            "web_search": "tavily_search_tavily",
+            "fetch": "web-fetch",
+            "delete_file": "remove-files",
+        }
+        for invented, expected in cases.items():
+            self.assertEqual(main.codegpt.resolve_tool_name(invented, self.AVAILABLE), expected, invented)
+
+    def test_unknown_name_without_match_is_left_alone(self):
+        self.assertEqual(main.codegpt.resolve_tool_name("totally_made_up", self.AVAILABLE), "totally_made_up")
+
+    def test_alias_not_applied_when_target_missing(self):
+        # `web-fetch` is unavailable here, so the alias must not fire blindly.
+        limited = {"view"}
+        self.assertEqual(main.codegpt.resolve_tool_name("fetch", limited), "fetch")
+
+    def test_adapt_request_body_rewrites_history_tool_calls(self):
+        request = {
+            "messages": [
+                {"role": "user", "content": "search"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "file_search", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "hits"},
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "codebase-retrieval", "description": "x",
+                "parameters": {"type": "object", "properties": {}},
+            }}],
+        }
+        body = main.codegpt.adapt_request_body(request)
+        joined = " ".join(str(m.get("content") or "") for m in body["messages"])
+        self.assertIn("codebase-retrieval", joined)
+        self.assertNotIn("file_search", joined)

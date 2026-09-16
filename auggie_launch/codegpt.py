@@ -151,12 +151,15 @@ def _flatten_tool_calls(tool_calls: Any) -> str:
             fn = call.get("function") if isinstance(call.get("function"), dict) else {}
             name = fn.get("name") or call.get("name") or "tool"
             args = fn.get("arguments") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments") or {})
-            lines.append(f"[tool call {name}({args})]")
+            lines.append(f"(tool invocation on record: {name} {args})")
     return "\n".join(lines)
 
 
 def gemini_safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Repairs a message list that Vertex/Gemini would reject with 400.
+
+    The folded text is deliberately phrased as a record of past events rather
+    than as a tool-call syntax, so the model does not learn to imitate it.
 
     Three Vertex quirks are handled here:
       * a conversation ending on a model turn is rejected ("Requests ending with
@@ -187,7 +190,7 @@ def gemini_safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
             content = msg.get("content")
             if isinstance(content, list):
                 content = text_from_value(content)
-            pending.append(f"[tool result] {content if content is not None else ''}")
+            pending.append(f"(tool output on record: {content if content is not None else ''})")
             continue
         if role in {"assistant", "model"}:
             calls = _flatten_tool_calls(msg.get("tool_calls"))
@@ -216,14 +219,87 @@ def gemini_safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return out
 
 
+# Models routinely invent tool names from their training data (`file_search`,
+# `read_file`, `bash`). Auggie only knows its own names, so an invented call
+# fails with "Tool X not found" and derails the turn. Unknown names that match a
+# known tool's job are remapped onto the real one.
+_TOOL_ALIASES = {
+    "file_search": "codebase-retrieval",
+    "search_files": "codebase-retrieval",
+    "grep_search": "codebase-retrieval",
+    "grep": "codebase-retrieval",
+    "search": "codebase-retrieval",
+    "code_search": "codebase-retrieval",
+    "read_file": "view",
+    "read": "view",
+    "open_file": "view",
+    "cat": "view",
+    "list_files": "view",
+    "ls": "view",
+    "write_file": "save-file",
+    "create_file": "save-file",
+    "edit_file": "str-replace-editor",
+    "str_replace": "str-replace-editor",
+    "replace": "str-replace-editor",
+    "bash": "launch-process",
+    "shell": "launch-process",
+    "run_command": "launch-process",
+    "execute_command": "launch-process",
+    "terminal": "launch-process",
+    "web_search": "tavily_search_tavily",
+    "fetch": "web-fetch",
+    "fetch_url": "web-fetch",
+    "delete_file": "remove-files",
+    "rm": "remove-files",
+}
+
+
+def resolve_tool_name(name: str, available: set[str]) -> str:
+    """Maps a model-invented tool name onto a real Auggie tool, if one matches."""
+    if name in available:
+        return name
+    mapped = _TOOL_ALIASES.get(name.lower())
+    if mapped and mapped in available:
+        return mapped
+    # Last resort: an unambiguous suffix match (e.g. "view" vs "view-session").
+    candidates = [t for t in available if t == name or t.endswith(f"_{name}") or t.startswith(f"{name}_")]
+    if len(candidates) == 1:
+        return candidates[0]
+    return name
+
+
+def _normalize_tool_calls(msg: dict[str, Any], available: set[str]) -> None:
+    """Rewrites an assistant message's tool_call names in place."""
+    calls = msg.get("tool_calls")
+    if not isinstance(calls, list):
+        return
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function")
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            fn["name"] = resolve_tool_name(fn["name"], available)
+
+
 def adapt_request_body(request: dict[str, Any]) -> dict[str, Any]:
     """Rewrites an OpenAI chat body into the CodeGPT agent request shape.
 
     OpenAI tools use {type, function:{name, description, parameters}}; CodeGPT
     expects a flat {name, description, parameters}. `agentId` replaces `model`.
     """
+    raw_tools = request.get("tools") if isinstance(request.get("tools"), list) else []
+    available = {
+        (t.get("function") or {}).get("name") or t.get("name")
+        for t in raw_tools
+        if isinstance(t, dict)
+    }
+    available = {n for n in available if isinstance(n, str)}
+    messages = [dict(m) for m in (request.get("messages") or []) if isinstance(m, dict)]
+    for msg in messages:
+        _normalize_tool_calls(msg, available)
+
     body: dict[str, Any] = {
-        "messages": gemini_safe_messages(request.get("messages") or []),
+        "messages": gemini_safe_messages(messages),
         "temperature": request.get("temperature", 0),
         "stream": True,
         "format": "json",
