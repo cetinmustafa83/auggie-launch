@@ -699,9 +699,13 @@ class TestCodeGPTGeminiCompat(unittest.TestCase):
                 },
             }],
         }
-        with patch("auggie_launch.config.CODEGPT_AGENT_ID", "agent-123"):
+        with patch("auggie_launch.config.TARGET_MODEL", "deepseek-v4.1-flash"), \
+             patch("auggie_launch.config.CODEGPT_SESSION_ID", "sess-1"):
             body = main.codegpt.adapt_request_body(request)
-        self.assertEqual(body["agentId"], "agent-123")
+        # The model is addressed as modelId, and no agent is involved.
+        self.assertEqual(body["modelId"], "deepseek-v4.1-flash")
+        self.assertNotIn("agentId", body)
+        self.assertEqual(body["session_id"], "sess-1")
         tool = body["tools"][0]
         self.assertEqual(tool["name"], "calc")
         self.assertNotIn("function", tool)
@@ -1028,3 +1032,90 @@ class TestConsecutiveRoleCollapse(unittest.TestCase):
         roles = [m["role"] for m in out]
         for a, b in itertools.pairwise(roles):
             self.assertNotEqual(a, b)
+
+
+
+class TestInclusiveModelBridge(unittest.TestCase):
+    """CodeGPT Plus serves its inclusive ("economy") models on
+    /chat/tools/<harness>, addressed by `modelId`, with the model's upstream in
+    an `X-Provider` header. No agent is involved -- an earlier agent-based
+    implementation could not reach these models at all."""
+
+    def test_chat_path_uses_the_harness_suffix(self):
+        with patch("auggie_launch.config.CODEGPT_HARNESS", "codegpt"):
+            self.assertEqual(main.codegpt.chat_path(), "/chat/tools/codegpt")
+            self.assertEqual(main.codegpt.chat_path(has_tools=True), "/chat/tools/codegpt")
+
+    def test_upstream_url_uses_the_bridge_path(self):
+        with patch("auggie_launch.config.IS_CODEGPT", True), \
+             patch("auggie_launch.config.CODEGPT_HARNESS", "codegpt"), \
+             patch("auggie_launch.upstream.active_base_url", return_value="https://api.codegpt.co/api/v1"):
+            self.assertEqual(
+                main.upstream.upstream_url(True),
+                "https://api.codegpt.co/api/v1/chat/tools/codegpt",
+            )
+
+    def test_provider_header_is_sent(self):
+        with patch("auggie_launch.config.CODEGPT_PROVIDER", "openrouter"), \
+             patch("auggie_launch.config.CODEGPT_TOKEN", "tok"), \
+             patch("auggie_launch.config.IS_CODEGPT", True):
+            headers = main.codegpt.extra_headers()
+        self.assertEqual(headers["X-Provider"], "openrouter")
+        self.assertEqual(headers["Authorization"], "Bearer tok")
+        self.assertEqual(headers["tokens"], "true")
+
+    def test_provider_header_omitted_when_unset(self):
+        with patch("auggie_launch.config.CODEGPT_PROVIDER", ""), \
+             patch("auggie_launch.config.CODEGPT_TOKEN", "tok"), \
+             patch("auggie_launch.config.IS_CODEGPT", True):
+            headers = main.codegpt.extra_headers()
+        self.assertNotIn("X-Provider", headers)
+
+    def test_body_carries_model_id_and_session_id(self):
+        request = {"model": "deepseek-v4.1-flash", "messages": [{"role": "user", "content": "hi"}]}
+        with patch("auggie_launch.config.CODEGPT_SESSION_ID", "sess-abc"):
+            body = main.codegpt.adapt_request_body(request)
+        self.assertEqual(body["modelId"], "deepseek-v4.1-flash")
+        self.assertEqual(body["session_id"], "sess-abc")
+        self.assertNotIn("agentId", body)
+
+
+_REMAP_REQUEST = {"tools": [
+    {"type": "function", "function": {"name": "launch-process", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "view", "parameters": {"type": "object", "properties": {}}}},
+]}
+
+
+class TestStreamedToolCallRemap(unittest.TestCase):
+    """Remapping must happen after the fragments are merged: rewriting each
+    delta on its own produced a full command from an empty argument set, then
+    concatenated the real arguments after it -- invalid JSON, and the stream
+    died with 'Unexpected non-whitespace character after JSON'."""
+
+    def test_fragmented_arguments_produce_one_valid_call(self):
+        deltas = [
+            {"index": 0, "id": "call_x", "type": "function", "function": {"name": "grep_search", "arguments": ""}},
+            {"index": 0, "function": {"arguments": ""}},
+            {"index": 0, "function": {"arguments": '{"pattern":"'}},
+            {"index": 0, "function": {"arguments": "func_0_5"}},
+            {"index": 0, "function": {"arguments": '"'}},
+            {"index": 0, "function": {"arguments": "}"}},
+        ]
+        with patch("auggie_launch.config.IS_CODEGPT", True):
+            resolved = main.proxy.resolve_tool_calls(_REMAP_REQUEST, deltas)
+        self.assertEqual(len(resolved), 1)
+        name = resolved[0]["function"]["name"]
+        args = resolved[0]["function"]["arguments"]
+        self.assertEqual(name, "launch-process")
+        parsed = json.loads(args)  # must not raise
+        self.assertIn("grep -rn", parsed["command"])
+        self.assertIn("func_0_5", parsed["command"])
+
+    def test_native_tool_names_are_left_alone(self):
+        deltas = [
+            {"index": 0, "id": "c1", "type": "function", "function": {"name": "view", "arguments": '{"path":"a.py"}'}},
+        ]
+        with patch("auggie_launch.config.IS_CODEGPT", True):
+            resolved = main.proxy.resolve_tool_calls(_REMAP_REQUEST, deltas)
+        self.assertEqual(resolved[0]["function"]["name"], "view")
+        self.assertEqual(json.loads(resolved[0]["function"]["arguments"]), {"path": "a.py"})

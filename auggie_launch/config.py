@@ -95,6 +95,11 @@ CODEGPT_ORG_ID = ""
 CODEGPT_DISTINCT_ID = ""
 CODEGPT_SIGNED_DISTINCT_ID = ""
 CODEGPT_VERSION = "3.24.70"
+# Inclusive-model bridge: the endpoint is /chat/tools/<harness> and the model's
+# upstream must be named in an X-Provider header. No agent is involved.
+CODEGPT_HARNESS = "codegpt"
+CODEGPT_PROVIDER = ""
+CODEGPT_SESSION_ID = ""
 
 # --- 9router & Modern LLM Specific Features ---
 IS_9ROUTER = False
@@ -500,6 +505,7 @@ def load_config() -> None:
     # CodeGPT Plus: agent-backed cloud that speaks an OpenAI-shaped SSE stream.
     global IS_CODEGPT, CODEGPT_SESSION_URL, CODEGPT_TOKEN, CODEGPT_AGENT_ID, CODEGPT_ORG_ID
     global CODEGPT_DISTINCT_ID, CODEGPT_SIGNED_DISTINCT_ID, CODEGPT_VERSION
+    global CODEGPT_HARNESS, CODEGPT_PROVIDER, CODEGPT_SESSION_ID
     global HISTORY_SUMMARY_ENABLED, HISTORY_SUMMARY_MIN_VERSION, HISTORY_SUMMARY_TRIGGER_TOKENS
     global HISTORY_SUMMARY_MAX_HISTORY_CHARS, HISTORY_SUMMARY_INPUT_BUDGET_RATIO
     # Unset -> default sidecar URL. Set-but-empty -> disable sidecar probing (pinned token).
@@ -517,6 +523,9 @@ def load_config() -> None:
     CODEGPT_DISTINCT_ID = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_DISTINCT_ID") or "").strip()
     CODEGPT_SIGNED_DISTINCT_ID = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_SIGNED_DISTINCT_ID") or "").strip()
     CODEGPT_VERSION = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_VERSION") or "3.24.70").strip()
+    CODEGPT_HARNESS = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_HARNESS") or "codegpt").strip()
+    CODEGPT_PROVIDER = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_PROVIDER") or "").strip()
+    CODEGPT_SESSION_ID = (os.environ.get("AUGGIE_LAUNCH_CODEGPT_SESSION_ID") or "").strip()
     IS_CODEGPT = detect_codegpt(TARGET_BASE_URL)
     DYNAMIC_MODELS = env_truthy("AUGGIE_LAUNCH_DYNAMIC_MODELS", True)
     USE_COMPLETION_TOKENS = (os.environ.get("AUGGIE_LAUNCH_USE_COMPLETION_TOKENS") or "auto").strip().lower()

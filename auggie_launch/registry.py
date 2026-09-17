@@ -82,17 +82,14 @@ def codegpt_model_ids() -> list[str]:
     Falls back to the known plan list so Auggie always has something to pick
     even when the CodeGPT extension has not been opened on this machine yet.
     """
+    # The inclusive ("economy") tier: unlimited, and usable with no agent.
     fallback = [
+        "deepseek-v4.1-flash",
+        "deepseek-v4-flash",
         "gemini-3.8-flash",
         "gemini-3.7-flash",
-        "claude-sonnet-5-bedrock",
-        "glm-5.2",
-        "deepseek-v4.1-flash",
-        "laguna-s-2.1",
-        "nemotron-3-ultra",
-        "MiniMax-M3",
-        "MiniMax-M2.7",
-        "kimi-k3",
+        "gemini-3.6-flash",
+        "ox-alpha",
     ]
     path = os.path.expanduser("~/.codegpt/db.sqlite")
     if not os.path.exists(path):

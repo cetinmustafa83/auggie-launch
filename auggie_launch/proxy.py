@@ -116,10 +116,13 @@ def resolve_tool_calls(openai_request: dict[str, Any], tool_calls: list[dict[str
     if not available:
         return tool_calls
 
+    from .truncation import merge_stream_tool_calls
+
+    # Merge the streamed fragments FIRST. Remapping each delta individually
+    # would rewrite a partial (often empty) argument set into a full command and
+    # then concatenate that with the real arguments, producing invalid JSON.
     resolved: list[dict[str, Any]] = []
-    for call in tool_calls:
-        if not isinstance(call, dict):
-            continue
+    for call in merge_stream_tool_calls(tool_calls):
         fn = call.get("function")
         if isinstance(fn, dict) and isinstance(fn.get("name"), str):
             args = codegpt._coerce_arguments(fn.get("arguments"))

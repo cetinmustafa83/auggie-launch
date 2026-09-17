@@ -7,6 +7,11 @@ and the project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- CodeGPT Plus inclusive ("economy") models: the bridge is
+  `POST /chat/tools/<harness>` addressed by `modelId`, with the model's upstream
+  in an `X-Provider` header. No agent is involved, so deepseek-v4.1-flash and the
+  other unlimited models are now reachable
+  (`AUGGIE_LAUNCH_CODEGPT_PROVIDER`, `AUGGIE_LAUNCH_CODEGPT_HARNESS`).
 - `AUGGIE_LAUNCH_REPLY_LANGUAGE` to pin replies to one language; upstreams
   otherwise drifted into an arbitrary language mid-answer.
 - CodeGPT Plus upstream (`auggie_launch/codegpt.py`): auto-detected on
@@ -25,6 +30,10 @@ and the project uses [Semantic Versioning](https://semver.org/).
   (`AUGGIE_LAUNCH_HISTORY_SUMMARY*`).
 
 ### Fixed
+- Streamed tool calls are remapped only after the fragments are merged.
+  Remapping each delta on its own built a full command from an empty argument
+  set and then concatenated the real arguments after it, producing invalid JSON
+  and killing the stream.
 - Timeouts: pooled HTTP connections kept the timeout of whichever request
   created them, so a short-lived call capped a later long one. The socket
   timeout is now refreshed on acquire.

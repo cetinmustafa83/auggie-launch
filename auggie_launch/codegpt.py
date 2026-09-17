@@ -93,9 +93,14 @@ def session_field(name: str, env_value: str) -> str:
     return str(value or "").strip()
 
 
-def chat_path(has_tools: bool) -> str:
-    """CodeGPT routes tool calls and plain chats through different agents paths."""
-    return "/chat/tools" if has_tools else "/chat/extension"
+def chat_path(has_tools: bool = True) -> str:
+    """The CodeGPT Plus free-tier bridge path.
+
+    Discovered from the extension's own traffic: the inclusive-model endpoint is
+    `/chat/tools/<harness>`, where `<harness>` is the client name. It takes a
+    `modelId` plus an `X-Provider` header and needs no agent at all.
+    """
+    return f"/chat/tools/{config.CODEGPT_HARNESS}"
 
 
 def extra_headers() -> dict[str, str]:
@@ -106,6 +111,9 @@ def extra_headers() -> dict[str, str]:
         "channel": "api",
         "codegpt-version": config.CODEGPT_VERSION,
     }
+    # Required by the inclusive-model endpoint; it names the model's upstream.
+    if config.CODEGPT_PROVIDER:
+        headers["X-Provider"] = config.CODEGPT_PROVIDER
     token = session_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -444,10 +452,12 @@ def _normalize_tool_calls(msg: dict[str, Any], available: set[str]) -> None:
 
 
 def adapt_request_body(request: dict[str, Any]) -> dict[str, Any]:
-    """Rewrites an OpenAI chat body into the CodeGPT agent request shape.
+    """Rewrites an OpenAI chat body into the CodeGPT bridge request shape.
 
     OpenAI tools use {type, function:{name, description, parameters}}; CodeGPT
-    expects a flat {name, description, parameters}. `agentId` replaces `model`.
+    expects a flat {name, description, parameters}. The model is addressed as
+    `modelId` (not `model`) and a `session_id` accompanies `requestId`; no agent
+    is involved.
     """
     raw_tools = request.get("tools") if isinstance(request.get("tools"), list) else []
     available = {
@@ -466,10 +476,11 @@ def adapt_request_body(request: dict[str, Any]) -> dict[str, Any]:
         "stream": True,
         "format": "json",
         "requestId": str(uuid.uuid4()),
+        "session_id": config.CODEGPT_SESSION_ID or f"{config.CODEGPT_HARNESS}-{session_token()[:24]}",
     }
-    agent_id = config.CODEGPT_AGENT_ID
-    if agent_id:
-        body["agentId"] = agent_id
+    model_id = request.get("model") or config.TARGET_MODEL
+    if isinstance(model_id, str) and model_id:
+        body["modelId"] = model_id
 
     tools = request.get("tools")
     if isinstance(tools, list) and tools:
