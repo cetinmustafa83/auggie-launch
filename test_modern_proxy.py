@@ -1472,3 +1472,35 @@ class TestFailureTodo(unittest.TestCase):
                 )
         self.assertFalse(ok)
         self.assertIn(path, buf.getvalue())
+
+
+class TestFlagDeliveryEndToEnd(unittest.TestCase):
+    """Serves a real request through the proxy and reads the flags the CLI would
+    see, so the plumbing is verified rather than assumed."""
+
+    def test_get_models_reports_raised_ceiling_and_modes(self):
+        import json as _json
+        import threading
+        import time as _time
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+
+        with patch("auggie_launch.config.REQUIRE_LOCAL_TOKEN", False), \
+             patch("auggie_launch.config.SESSION_MODE", "full-access"), \
+             patch("auggie_launch.config.AGENT_MAX_ITERATIONS", 10000):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), main.proxy.AuggieProxy)
+            port = server.server_address[1]
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                _time.sleep(0.3)
+                request = urllib.request.Request(f"http://127.0.0.1:{port}/get-models")
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    payload = _json.loads(response.read())
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        flags = payload.get("feature_flags", {})
+        self.assertEqual(flags.get("agent_max_iterations"), 10000)
+        self.assertIs(flags.get("cliEnablePlanMode"), True)
+        self.assertIs(flags.get("cliEnablePersona"), True)
