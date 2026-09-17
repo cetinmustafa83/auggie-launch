@@ -1658,3 +1658,56 @@ class TestDebugPruning(unittest.TestCase):
     def test_missing_directory_is_harmless(self):
         with patch("auggie_launch.config.DEBUG_DIR", "/nonexistent/debug/dir"):
             self.assertEqual(main.proxy.prune_debug_dir(), 0)
+
+
+class TestSessionLock(unittest.TestCase):
+    """The subscription is per-user, so a second concurrent session contends for
+    it. The lock is advisory: warn, never refuse."""
+
+    def setUp(self):
+        import tempfile
+        self.lock = os.path.join(tempfile.mkdtemp(), "session.lock")
+
+    def test_first_acquire_succeeds(self):
+        ok, holder = main.server.acquire_session_lock(self.lock)
+        self.assertTrue(ok)
+        self.assertEqual(holder, "")
+        self.assertTrue(os.path.isfile(self.lock))
+
+    def test_a_live_foreign_pid_is_reported(self):
+        with open(self.lock, "w", encoding="utf-8") as fh:
+            json.dump({"pid": 1, "started": "2026-01-01 00:00", "cwd": "/elsewhere"}, fh)
+        ok, holder = main.server.acquire_session_lock(self.lock)
+        self.assertFalse(ok)
+        self.assertIn("pid 1", holder)
+        self.assertIn("/elsewhere", holder)
+
+    def test_a_dead_pid_is_reclaimed(self):
+        with patch.object(main.server, "_pid_alive", return_value=False):
+            with open(self.lock, "w", encoding="utf-8") as fh:
+                json.dump({"pid": 999, "cwd": "/gone"}, fh)
+            ok, _ = main.server.acquire_session_lock(self.lock)
+        self.assertTrue(ok, "a crashed session must not wedge every later run")
+
+    def test_own_pid_does_not_warn(self):
+        with open(self.lock, "w", encoding="utf-8") as fh:
+            json.dump({"pid": os.getpid(), "cwd": os.getcwd()}, fh)
+        ok, _ = main.server.acquire_session_lock(self.lock)
+        self.assertTrue(ok)
+
+    def test_release_only_removes_our_own_lock(self):
+        with open(self.lock, "w", encoding="utf-8") as fh:
+            json.dump({"pid": 1}, fh)
+        main.server.release_session_lock(self.lock)
+        self.assertTrue(os.path.exists(self.lock), "must not delete another session's lock")
+
+    def test_release_removes_our_lock(self):
+        main.server.acquire_session_lock(self.lock)
+        main.server.release_session_lock(self.lock)
+        self.assertFalse(os.path.exists(self.lock))
+
+    def test_corrupt_lock_is_treated_as_stale(self):
+        with open(self.lock, "w", encoding="utf-8") as fh:
+            fh.write("not json")
+        ok, _ = main.server.acquire_session_lock(self.lock)
+        self.assertTrue(ok)

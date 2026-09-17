@@ -103,6 +103,60 @@ leaving you to guess:
   [WARN] Repo hygiene — .env mode 664 is world/group readable
 ```
 
+## Session modes
+
+```bash
+auggie-launch --mode plan          # read-only: every mutating tool is denied
+auggie-launch --mode code          # writes allowed, the shell still asks
+auggie-launch --mode full-access   # nothing asks; finishes the task
+```
+
+| Mode | Files | Shell | Turn limit | On exit |
+|---|---|---|
+| `plan` | denied | denied | default | — |
+| `code` | allowed | asks | default | — |
+| `full-access` | allowed | allowed | raised to 10,000 | runs the quality gate |
+
+**full-access does not escalate privilege.** The shell is simply unrestricted,
+so a `sudo` the model decides it needs is run by the CLI and *your terminal*
+prompts for the password. The proxy never sees or stores it — a stored root
+password would be a far worse problem than the one it solves.
+
+Because the subscription is per-user, a second concurrent `auggie-launch` warns:
+
+```
+[auggie-launch] another session appears to be active (pid 4821 since 10:32 in
+/home/me/api); the subscription is per-user, so responses may contend
+```
+
+## Post-run checks
+
+With `AUGGIE_LAUNCH_POST_RUN_CHECKS=true` (the default), the launcher runs the
+same gate as `make check` once the CLI exits, and owns the verdict rather than
+trusting the model's summary:
+
+```
+post-run checks
+  [PASS] lint
+  [PASS] types
+  [FAIL] tests
+         AssertionError: expected 3, got 2
+1 check(s) FAILED -- fix before treating the task as done
+recorded in TODO.md
+```
+
+A failure is appended to `TODO.md` with the command and the tail of its output,
+so it survives the scrollback. Set `AUGGIE_LAUNCH_CHECK_TIMEOUT` if a suite is
+legitimately slow.
+
+## Keeping the CLI current
+
+```bash
+auggie-launch --doctor              # compares your CLI against npm
+auggie-launch --update-auggie       # npm install -g @augmentcode/auggie@latest
+auggie-launch --doctor --no-update-check   # skip the network call
+```
+
 ## Sessions
 
 ```bash

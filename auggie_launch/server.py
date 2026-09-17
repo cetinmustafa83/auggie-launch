@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import ThreadingHTTPServer
@@ -183,6 +185,65 @@ def report_post_run_checks(results: list[dict[str, Any]]) -> bool:
             print(f"could not record the failures: {exc}")
         return False
     print("all checks green")
+    return True
+
+
+# The subscription is per-user, so two concurrent sessions contend for it. The
+# lock is advisory: it warns and lets the operator decide rather than refusing to
+# start, because a stale lock must never block a legitimate run.
+LOCK_PATH = os.path.join(tempfile.gettempdir(), "auggie-launch.session.lock")
+
+
+def acquire_session_lock(path: str = "") -> tuple[bool, str]:
+    """Records this session. Returns (acquired, holder description).
+
+    Stale locks are reclaimed: the recorded pid is checked for liveness first, so
+    a crash does not wedge every later run.
+    """
+    target = path or LOCK_PATH
+    payload = {"pid": os.getpid(), "started": time.strftime("%Y-%m-%d %H:%M:%S"), "cwd": os.getcwd()}
+    if os.path.isfile(target):
+        try:
+            with open(target, encoding="utf-8") as fh:
+                existing = json.load(fh)
+        except Exception:
+            existing = {}
+        other = int(existing.get("pid") or 0)
+        if other and other != os.getpid() and _pid_alive(other):
+            where = existing.get("cwd") or "?"
+            when = existing.get("started") or "?"
+            return False, f"pid {other} since {when} in {where}"
+    try:
+        with open(target, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+    except OSError:
+        # An unwritable lock directory is not worth failing a session over.
+        return True, ""
+    return True, ""
+
+
+def release_session_lock(path: str = "") -> None:
+    """Removes the lock only if this process owns it."""
+    target = path or LOCK_PATH
+    try:
+        with open(target, encoding="utf-8") as fh:
+            holder = json.load(fh)
+        if int(holder.get("pid") or 0) != os.getpid():
+            return
+        os.remove(target)
+    except Exception:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
     return True
 
 

@@ -14,11 +14,13 @@ from .doctor import run_doctor, update_auggie
 from .injections import build_injected_environment, generate_injected_mcp_config
 from .proxy import AuggieProxy
 from .server import (
+    acquire_session_lock,
     find_free_port,
     mode_runs_until_done,
     permissions_for_mode,
     print_env,
     print_models,
+    release_session_lock,
     report_post_run_checks,
     stop_server,
 )
@@ -211,6 +213,15 @@ def main() -> None:
     env = build_injected_environment(proxy_url)
 
     # Injected MCP config if enabled and not already provided
+    locked, holder = acquire_session_lock()
+    if not locked:
+        # Advisory: the subscription is per-user, so a second session contends
+        # for it. Warn rather than refuse, since a stale lock would otherwise
+        # block a legitimate run.
+        print(f"[auggie-launch] another session appears to be active ({holder}); "
+              f"the subscription is per-user, so responses may contend",
+              file=sys.stderr)
+
     if config.AUTO_INJECT_MCP and "--mcp-config" not in pass_args:
         mcp_path = generate_injected_mcp_config()
         if mcp_path and os.path.isfile(mcp_path):
@@ -233,6 +244,8 @@ def main() -> None:
             stop_server(httpd)
         except KeyboardInterrupt:
             pass
+
+    release_session_lock()
 
     if config.POST_RUN_CHECKS:
         # Runs after the proxy is down: the gate starts its own processes, and
