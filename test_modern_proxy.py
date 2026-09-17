@@ -1420,3 +1420,55 @@ class TestPostRunChecks(unittest.TestCase):
 
     def test_no_checks_means_no_verdict(self):
         self.assertTrue(main.server.report_post_run_checks([]))
+
+
+class TestFailureTodo(unittest.TestCase):
+    """A red gate leaves a durable record instead of scrolling past."""
+
+    def test_failures_are_written_with_their_output(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "TODO.md")
+        results = [
+            {"name": "lint", "ok": True, "command": "ruff", "output": ""},
+            {"name": "tests", "ok": False, "command": "unittest",
+             "output": "FAIL: test_x\nAssertionError: nope"},
+        ]
+        target = main.server.write_failure_todo(results, path)
+        self.assertEqual(target, path)
+        text = open(path, encoding="utf-8").read()
+        self.assertIn("- [ ] **tests**", text)
+        self.assertIn("AssertionError: nope", text)
+        self.assertNotIn("**lint**", text, "passing checks must not be recorded")
+
+    def test_green_run_writes_nothing(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "TODO.md")
+        target = main.server.write_failure_todo(
+            [{"name": "lint", "ok": True, "command": "ruff", "output": ""}], path
+        )
+        self.assertEqual(target, "")
+        self.assertFalse(os.path.exists(path))
+
+    def test_repeated_failures_append(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "TODO.md")
+        row = {"name": "tests", "ok": False, "command": "unittest", "output": "boom"}
+        main.server.write_failure_todo([row], path)
+        main.server.write_failure_todo([row], path)
+        text = open(path, encoding="utf-8").read()
+        self.assertEqual(text.count("- [ ] **tests**"), 2)
+        self.assertTrue(text.startswith("# TODO"))
+
+    def test_report_points_at_the_record(self):
+        import contextlib
+        import io
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "TODO.md")
+        buf = io.StringIO()
+        with patch.object(main.server, "write_failure_todo", side_effect=lambda r: path):
+            with contextlib.redirect_stdout(buf):
+                ok = main.server.report_post_run_checks(
+                    [{"name": "tests", "ok": False, "command": "unittest", "output": "x"}]
+                )
+        self.assertFalse(ok)
+        self.assertIn(path, buf.getvalue())

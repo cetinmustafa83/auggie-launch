@@ -4,6 +4,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from typing import Any
 
@@ -111,6 +112,38 @@ def post_run_checks() -> list[dict[str, Any]]:
     return results
 
 
+def write_failure_todo(results: list[dict[str, Any]], path: str = "") -> str:
+    """Appends failing checks to a TODO file and returns its path.
+
+    A red gate should leave a durable record rather than scrolling past in the
+    terminal, so the next session (or the next person) picks it up.
+    """
+    failures = [row for row in results if not row.get("ok")]
+    if not failures:
+        return ""
+    target = path or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "TODO.md"
+    )
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    lines: list[str] = []
+    if not os.path.isfile(target):
+        lines.append("# TODO")
+        lines.append("")
+        lines.append("Written by auggie-launch when the post-run gate fails.")
+        lines.append("")
+    lines.append(f"## {stamp} — post-run checks failed")
+    lines.append("")
+    for row in failures:
+        lines.append(f"- [ ] **{row['name']}** — `{row.get('command', '')}`")
+        tail = [ln for ln in str(row.get("output") or "").splitlines() if ln.strip()][-6:]
+        for line in tail:
+            lines.append(f"      {line}")
+    lines.append("")
+    with open(target, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return target
+
+
 def report_post_run_checks(results: list[dict[str, Any]]) -> bool:
     """Prints the gate and returns True only when everything passed."""
     if not results:
@@ -129,6 +162,12 @@ def report_post_run_checks(results: list[dict[str, Any]]) -> bool:
     print("-" * 62)
     if failures:
         print(f"{len(failures)} check(s) FAILED -- fix before treating the task as done")
+        try:
+            target = write_failure_todo(results)
+            if target:
+                print(f"recorded in {target}")
+        except Exception as exc:
+            print(f"could not record the failures: {exc}")
         return False
     print("all checks green")
     return True
