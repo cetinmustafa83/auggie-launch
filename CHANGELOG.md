@@ -33,6 +33,9 @@ and the project uses [Semantic Versioning](https://semver.org/).
   (`AUGGIE_LAUNCH_HISTORY_SUMMARY*`).
 
 ### Fixed
+- Reasoning is no longer streamed inside raw ` thinking...` text: the CLI renders
+  reasoning itself, and the tags both leaked into the transcript and confused
+  the model on later turns. `AUGGIE_LAUNCH_STREAM_THINKING` defaults to off.
 - Streamed tool calls are remapped only after the fragments are merged.
   Remapping each delta on its own built a full command from an empty argument
   set and then concatenated the real arguments after it, producing invalid JSON

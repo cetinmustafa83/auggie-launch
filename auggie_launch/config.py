@@ -78,7 +78,10 @@ MODEL_CONTEXT_TOKENS_EXPLICIT = False
 MODEL_MAX_OUTPUT_TOKENS = 16000
 REQUIRE_LOCAL_TOKEN = True
 REASONING_EFFORT = ""
-STREAM_THINKING = True
+# Raw  tags are rendered verbatim by the CLI and end up in the transcript,
+# which also confuses the model on later turns. The CLI renders reasoning by
+# itself, so this stays off unless explicitly enabled.
+STREAM_THINKING = False
 
 # --- Auggie history summarization (session compaction) ---
 HISTORY_SUMMARY_ENABLED = True
@@ -480,7 +483,7 @@ def load_config() -> None:
         print("error: AUGGIE_LAUNCH_REASONING_EFFORT must be low, medium, or high", file=sys.stderr)
         sys.exit(2)
 
-    STREAM_THINKING = env_truthy("AUGGIE_LAUNCH_STREAM_THINKING", True)
+    STREAM_THINKING = env_truthy("AUGGIE_LAUNCH_STREAM_THINKING", False)
     IS_9ROUTER = detect_9router(TARGET_BASE_URL)
 
     # Auto-install 9router when the system cannot detect it at all

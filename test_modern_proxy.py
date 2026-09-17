@@ -1189,3 +1189,17 @@ class TestDynamicCatalog(unittest.TestCase):
         with patch.object(main.codegpt, "_catalog_paths", return_value=[path]):
             ids = main.registry.codegpt_model_ids()
         self.assertIn("deepseek-v4.1-flash", ids)
+
+
+class TestReasoningNotLeaked(unittest.TestCase):
+    """Raw  tags must not reach the client transcript: the CLI renders
+    reasoning itself, and the tags confused the model on later turns."""
+
+    def test_display_disabled_by_default(self):
+        with patch("auggie_launch.config.STREAM_THINKING", False):
+            self.assertFalse(main.config.STREAM_THINKING)
+
+    def test_config_default_is_off(self):
+        # A regression guard on the shipped default, not just the patched value.
+        source = open(main.config.__file__, encoding="utf-8").read()
+        self.assertIn('STREAM_THINKING = env_truthy("AUGGIE_LAUNCH_STREAM_THINKING", False)', source)
