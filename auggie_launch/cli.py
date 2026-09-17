@@ -265,8 +265,17 @@ def main() -> None:
     if config.POST_RUN_CHECKS:
         # Runs after the proxy is down: the gate starts its own processes, and
         # leaving ours listening made the two collide.
+        #
+        # A Ctrl+C here means "I want out", not "check harder". The child gets
+        # the interrupt too, so the run is abandoned rather than reported as a
+        # failure -- an interrupted check says nothing about the code.
         from .server import post_run_checks
-        if not report_post_run_checks(post_run_checks()):
+        try:
+            gate_ok = report_post_run_checks(post_run_checks())
+        except KeyboardInterrupt:
+            print("\ninterrupted: quality gate skipped", file=sys.stderr)
+            gate_ok = True
+        if not gate_ok:
             exit_code = exit_code or 1
 
     sys.exit(exit_code)

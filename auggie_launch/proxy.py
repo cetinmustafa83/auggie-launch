@@ -201,6 +201,18 @@ class AuggieProxy(BaseHTTPRequestHandler):
         if config.VERBOSE:
             super().log_message(fmt, *args)
 
+    def handle_one_request(self) -> None:
+        """Handles a request, tolerating a client that goes away mid-request.
+
+        A reset is normal here: the CLI abandons in-flight requests when it is
+        interrupted, and socketserver would otherwise print a full traceback for
+        something that is not a fault.
+        """
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, TimeoutError):
+            self.close_connection = True
+
     def send_json(self, value: Any, status: int = 200) -> None:
         data = json_bytes(value)
         self.send_response(status)

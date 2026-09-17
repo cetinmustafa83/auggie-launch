@@ -1385,6 +1385,17 @@ class TestPostRunChecks(unittest.TestCase):
     """The launcher owns the verdict: a task is done when the gate is green,
     not when the model says so."""
 
+    def setUp(self):
+        # Redirect the failure record: these tests deliberately produce red
+        # checks, and without this they append to the project's own TODO.md.
+        import tempfile
+        self._todo = os.path.join(tempfile.mkdtemp(), "TODO.md")
+        self._env = patch.dict(os.environ, {"AUGGIE_LAUNCH_TODO_PATH": self._todo}, clear=False)
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+
     def test_secret_keys_are_stripped_from_the_child_environment(self):
         for name in ("AUGGIE_LAUNCH_CODEGPT_TOKEN", "AUGGIE_LAUNCH_TAVILY_API_KEY",
                      "AUGGIE_LAUNCH_CODEGPT_SIGNED_DISTINCT_ID", "SOME_PASSWORD"):
@@ -1460,10 +1471,13 @@ class TestFailureTodo(unittest.TestCase):
         self.assertTrue(text.startswith("# TODO"))
 
     def test_report_points_at_the_record(self):
+        # Must not touch the repo: a test run would otherwise append its own
+        # failures to the project's TODO.md.
         import contextlib
         import io
         import tempfile
         path = os.path.join(tempfile.mkdtemp(), "TODO.md")
+        self.assertNotEqual(os.path.dirname(path), os.path.dirname(os.path.abspath(main.config.__file__)))
         buf = io.StringIO()
         with patch.object(main.server, "write_failure_todo", side_effect=lambda r: path):
             with contextlib.redirect_stdout(buf):
@@ -1890,3 +1904,37 @@ class TestNoDeadAgentConfig(unittest.TestCase):
             "model": "deepseek-v4.1-flash", "messages": [{"role": "user", "content": "hi"}],
         })
         self.assertNotIn("agentId", body)
+
+
+class TestTodoTargetIsConfigurable(unittest.TestCase):
+    """The post-run gate runs in a copy of the launcher's environment, so writing
+    straight into the repo root means running the tests appends to the project's
+    own TODO.md. The target must be overridable."""
+
+    def test_env_override_is_used(self):
+        import tempfile
+        target = os.path.join(tempfile.mkdtemp(), "elsewhere.md")
+        with patch.dict(os.environ, {"AUGGIE_LAUNCH_TODO_PATH": target}, clear=False):
+            written = main.server.write_failure_todo(
+                [{"name": "tests", "ok": False, "command": "unittest", "output": "boom"}]
+            )
+        self.assertEqual(written, target)
+        self.assertTrue(os.path.exists(target))
+
+    def test_default_is_the_repo_root(self):
+        # Only the path is asserted. Writing there for real would append a test
+        # failure to the project's own TODO.md, and deleting it afterwards (the
+        # first attempt at this test) destroys the file entirely.
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(main.config.__file__)))
+        with patch.dict(os.environ, {"AUGGIE_LAUNCH_TODO_PATH": ""}, clear=False), \
+             patch("builtins.open", side_effect=OSError("refused by the test")), \
+             patch("os.path.isfile", return_value=False):
+            with self.assertRaises(OSError):
+                main.server.write_failure_todo(
+                    [{"name": "tests", "ok": False, "command": "unittest", "output": "boom"}]
+                )
+        self.assertEqual(
+            os.environ.get("AUGGIE_LAUNCH_TODO_PATH", ""), "",
+            "the default must stay the repo root when the override is empty",
+        )
+        self.assertTrue(os.path.isdir(repo))

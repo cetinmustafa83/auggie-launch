@@ -136,7 +136,8 @@ def write_failure_todo(results: list[dict[str, Any]], path: str = "") -> str:
     failures = [row for row in results if not row.get("ok")]
     if not failures:
         return ""
-    target = path or os.path.join(
+    # Overridable so a test run does not append to the project's own TODO.md.
+    target = path or (os.environ.get("AUGGIE_LAUNCH_TODO_PATH") or "").strip() or os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "TODO.md"
     )
     stamp = time.strftime("%Y-%m-%d %H:%M")
