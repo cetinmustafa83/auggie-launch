@@ -1711,3 +1711,82 @@ class TestSessionLock(unittest.TestCase):
             fh.write("not json")
         ok, _ = main.server.acquire_session_lock(self.lock)
         self.assertTrue(ok)
+
+
+class TestUsageStats(unittest.TestCase):
+    """Counters, so "is it slow" and "which tool does it reach for" are answered
+    by a command instead of by reading logs."""
+
+    def setUp(self):
+        import tempfile
+        self.path = os.path.join(tempfile.mkdtemp(), "stats.json")
+        self._env = patch.dict(os.environ, {"AUGGIE_LAUNCH_STATS_PATH": self.path}, clear=False)
+        self._env.start()
+        main.stats._STATE = None
+        main.stats.reset()
+
+    def tearDown(self):
+        self._env.stop()
+        main.stats._STATE = None
+
+    def test_requests_are_counted_by_kind(self):
+        main.stats.record_request("stream", 100)
+        main.stats.record_request("json", 50)
+        data = main.stats.snapshot()
+        self.assertEqual(data["requests"], 2)
+        self.assertEqual(data["streams"], 1)
+        self.assertEqual(data["json_requests"], 1)
+
+    def test_payload_samples_are_bounded(self):
+        for i in range(300):
+            main.stats.record_request("stream", i + 1)
+        sizes = main.stats.snapshot()["payload_bytes"]
+        self.assertEqual(len(sizes), 200, "the history must not grow without bound")
+
+    def test_latency_stats_are_reported(self):
+        for value in (1.0, 2.0, 3.0):
+            main.stats.record_latency(value)
+        data = main.stats.snapshot()
+        self.assertEqual(data["latency_ms"], [1000, 2000, 3000])
+        text = main.stats.format_stats(data)
+        self.assertIn("p50 2000 ms", text)
+        self.assertIn("max 3000 ms", text)
+
+    def test_tool_calls_and_remaps_are_ranked(self):
+        main.stats.record_tool_call("view")
+        main.stats.record_tool_call("view")
+        main.stats.record_tool_call("grep")
+        main.stats.record_remap("file_search", "launch-process")
+        text = main.stats.format_stats()
+        self.assertIn("view (2)", text)
+        self.assertIn("file_search -> launch-process (1)", text)
+
+    def test_reset_clears_everything(self):
+        main.stats.record_request("stream", 10)
+        main.stats.record_tool_call("view")
+        main.stats.reset()
+        self.assertEqual(main.stats.snapshot()["requests"], 0)
+
+    def test_empty_state_says_so(self):
+        self.assertIn("no requests recorded yet", main.stats.format_stats())
+
+    def test_counters_survive_a_reload(self):
+        main.stats.record_request("stream", 10)
+        main.stats.snapshot()
+        main.stats._STATE = None  # simulate a fresh process
+        self.assertEqual(main.stats.snapshot()["requests"], 1)
+
+    def test_usage_records_token_totals(self):
+        main.stats.record_usage({"prompt_tokens": 120, "completion_tokens": 30})
+        main.stats.record_usage({"prompt_tokens": 80, "completion_tokens": 20})
+        data = main.stats.snapshot()
+        self.assertEqual(data["input_tokens"], 200)
+        self.assertEqual(data["output_tokens"], 50)
+
+    def test_zero_counters_never_divide_by_zero(self):
+        # format_stats must survive partial state, e.g. a truncated file.
+        text = main.stats.format_stats({"requests": 1, "payload_bytes": [], "latency_ms": []})
+        self.assertIn("requests         1", text)
+
+    def test_module_is_reachable_from_the_package(self):
+        self.assertTrue(hasattr(main, "stats"))

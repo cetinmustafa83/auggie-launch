@@ -11,6 +11,7 @@ from . import (  # noqa: F401
     proxy,
     registry,
     server,
+    stats,
     transform,
     truncation,
     upstream,

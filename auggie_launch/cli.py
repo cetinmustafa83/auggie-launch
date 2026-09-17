@@ -116,6 +116,8 @@ def main() -> None:
             "--no-update-check",
             "--update-auggie",
             "--models",
+            "--stats",
+            "--reset-stats",
             "--sessions",
             "--mode",
             "--help",
@@ -133,6 +135,8 @@ def main() -> None:
         print("  --no-update-check           Skip the CLI version comparison during --doctor")
         print("  --update-auggie             Install the latest @augmentcode/auggie globally")
         print("  --models                    List the models served to the CLI")
+        print("  --stats                     Show usage counters (requests, tools, remaps)")
+        print("  --reset-stats               Clear the usage counters")
         print("  --print-env                 Show resolved config")
         print("  -c, --continue              Resume the most recent session")
         print("  --resume [sessionId]        Resume a session (interactive picker without an id)")
@@ -174,6 +178,17 @@ def main() -> None:
                 config.AGENT_MAX_ITERATIONS, config.FULL_ACCESS_MAX_ITERATIONS
             )
         log(f"mode {mode}: {len(permissions)} tool permission(s) applied")
+
+    if "--stats" in launcher_args:
+        from .stats import print_stats
+        print_stats()
+        return
+
+    if "--reset-stats" in launcher_args:
+        from .stats import reset
+        reset()
+        print("usage counters cleared")
+        return
 
     if "--sessions" in launcher_args:
         print_sessions()

@@ -160,6 +160,8 @@ def resolve_tool_calls(openai_request: dict[str, Any], tool_calls: list[dict[str
             name, shaped = codegpt.route_tool_call(fn_call["name"], args, available)
             if name != fn_call["name"]:
                 log(f"tool remap: {fn_call['name']} -> {name}")
+                from . import stats as stats_mod
+                stats_mod.record_remap(str(fn_call['name']), name)
             fn_call["name"] = name
             if shaped != args:
                 fn_call["arguments"] = json.dumps(shaped, ensure_ascii=False)
@@ -311,6 +313,9 @@ class AuggieProxy(BaseHTTPRequestHandler):
     def forward_json(self, body: Any) -> None:
         openai_request = build_openai_request(body, stream=False)
         dump_debug_request(body, openai_request)
+        started = time.time()
+        from . import stats as stats_mod
+        stats_mod.record_request("json", len(json_bytes(openai_request)))
         try:
             with open_upstream_with_retries(json_bytes(openai_request), stream=False, timeout=int(config.UPSTREAM_TIMEOUT_SECONDS), label="json") as resp:
                 raw = resp.read()
@@ -322,7 +327,15 @@ class AuggieProxy(BaseHTTPRequestHandler):
                 message = choices[0].get("message") if isinstance(choices[0], dict) else None
                 if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
                     tool_calls = [call for call in message["tool_calls"] if isinstance(call, dict)]
-            self.send_json(augment_chat_response(text, str(uuid.uuid4()), openai_request, data.get("usage") if isinstance(data, dict) else None, tool_calls))
+            from . import stats as stats_mod
+            stats_mod.record_latency(time.time() - started)
+            for call in tool_calls:
+                fn = call.get("function") if isinstance(call, dict) else None
+                if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+                    stats_mod.record_tool_call(fn["name"])
+            usage_value = data.get("usage") if isinstance(data, dict) else None
+            stats_mod.record_usage(usage_value)
+            self.send_json(augment_chat_response(text, str(uuid.uuid4()), openai_request, usage_value, tool_calls))
         except urllib.error.HTTPError as exc:
             raw = compact_upstream_error(exc.msg, max_chars=2000)
             self.send_json({"error": "upstream_error", "message": raw, "status": exc.code}, status=502 if exc.code in {401, 403} else exc.code)
@@ -332,6 +345,9 @@ class AuggieProxy(BaseHTTPRequestHandler):
     def forward_stream(self, body: Any) -> None:
         openai_request = build_openai_request(body, stream=True)
         dump_debug_request(body, openai_request)
+        started = time.time()
+        from . import stats as stats_mod
+        stats_mod.record_request("stream", len(json_bytes(openai_request)))
         if config.VERBOSE:
             log(f"stream payload: {len(json_bytes(openai_request))} bytes, {len(openai_request.get('messages', []))} messages, {len(openai_request.get('tools') or [])} tools")
         request_id = str(uuid.uuid4())
@@ -453,6 +469,12 @@ class AuggieProxy(BaseHTTPRequestHandler):
                 accumulated.append("\n</think>\n\n")
 
             if not client_disconnected:
+                from . import stats as stats_mod
+                stats_mod.record_latency(time.time() - started)
+                for call in tool_calls:
+                    fn = call.get("function") if isinstance(call, dict) else None
+                    if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+                        stats_mod.record_tool_call(fn["name"])
                 final_text = "".join(accumulated)
                 merged_calls = resolve_tool_calls(openai_request, tool_calls)
                 final = augment_chat_response(final_text, request_id, openai_request, usage, merged_calls)
