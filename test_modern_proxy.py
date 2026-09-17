@@ -1258,3 +1258,94 @@ class TestConfigValidation(unittest.TestCase):
             main.config.report_config_warnings(["one", "two"])
         text = buf.getvalue()
         self.assertEqual(text.count("[auggie-launch] config warning:"), 2)
+
+
+class TestModelTiers(unittest.TestCase):
+    """The catalog's `economy` flag disagrees with the plan, so tier comes from
+    an explicit table built by calling each model."""
+
+    def test_unlimited_and_metered_are_separate(self):
+        unlimited = {m["id"] for m in main.codegpt.models_by_tier("unlimited")}
+        metered = {m["id"] for m in main.codegpt.models_by_tier("metered")}
+        self.assertIn("deepseek-v4.1-flash", unlimited)
+        self.assertIn("gemini-3.8-flash", unlimited)
+        self.assertTrue({"gpt-6-astra", "claude-fable-5-1", "kimi-k3"} <= metered)
+        self.assertFalse(unlimited & metered, "a model cannot be both")
+
+    def test_every_row_carries_a_provider(self):
+        for tier in ("unlimited", "metered"):
+            for row in main.codegpt.models_by_tier(tier):
+                self.assertTrue(row.get("provider"), row)
+
+    def test_panel_names_map_to_catalog_ids(self):
+        # The panel shows glm-5.3-flash; the bridge accepts glm-5.2.
+        self.assertEqual(main.codegpt.canonical_model_id("glm-5.3-flash"), "glm-5.2")
+        self.assertEqual(main.codegpt.canonical_model_id("meta-muse-spark-1.3"), "muse-spark-1.1")
+
+    def test_panel_name_is_reported_back(self):
+        self.assertEqual(main.codegpt.panel_name_for("glm-5.2"), "glm-5.3-flash")
+        self.assertEqual(main.codegpt.panel_name_for("deepseek-v4.1-flash"), "deepseek-v4.1-flash")
+
+    def test_tier_lookup_accepts_either_name(self):
+        self.assertEqual(main.codegpt.model_tier("glm-5.2"), "unlimited")
+        self.assertEqual(main.codegpt.model_tier("glm-5.3-flash"), "unlimited")
+        self.assertEqual(main.codegpt.model_tier("nope"), "")
+
+    def test_provider_resolves_without_the_catalog(self):
+        # The tier table is authoritative, so a missing catalog still resolves.
+        with patch("auggie_launch.config.CODEGPT_PROVIDER", ""), \
+             patch.object(main.codegpt, "_catalog_paths", return_value=["/nonexistent.json"]):
+            self.assertEqual(main.codegpt.provider_for_model("glm-5.3-flash"), "fireworksai")
+
+    def test_request_body_uses_the_canonical_id(self):
+        body = main.codegpt.adapt_request_body({
+            "model": "glm-5.3-flash", "messages": [{"role": "user", "content": "hi"}],
+        })
+        self.assertEqual(body["modelId"], "glm-5.2")
+
+
+class TestSessionModes(unittest.TestCase):
+    """`--mode` maps onto the CLI's repeatable --permission flag."""
+
+    def test_plan_denies_every_mutating_tool(self):
+        rules = main.server.permissions_for_mode("plan")
+        self.assertIsNotNone(rules)
+        self.assertTrue(all(r.endswith(":deny") for r in rules), rules)
+        self.assertIn("launch-process:deny", rules)
+        self.assertIn("str-replace-editor:deny", rules)
+
+    def test_code_allows_writes_but_not_the_shell(self):
+        rules = main.server.permissions_for_mode("code")
+        self.assertIn("str-replace-editor:allow", rules)
+        self.assertFalse(any(r.startswith("launch-process") for r in rules), rules)
+
+    def test_full_access_denies_nothing(self):
+        rules = main.server.permissions_for_mode("full-access")
+        self.assertTrue(all(r.endswith(":allow") for r in rules), rules)
+        self.assertIn("launch-process:allow", rules)
+
+    def test_unknown_mode_is_rejected(self):
+        self.assertIsNone(main.server.permissions_for_mode("nonsense"))
+
+    def test_read_only_session_does_not_route_search_to_a_denied_tool(self):
+        """`--mode plan` denies launch-process, so a search must not be remapped
+        onto it -- the CLI would refuse the call and the turn would spin."""
+        available = {"view", "save-file", "launch-process", "str-replace-editor"}
+        with patch("auggie_launch.config.SESSION_MODE", "plan"):
+            name, _ = main.codegpt.route_tool_call("file_search", {"pattern": "x"}, available)
+        self.assertNotEqual(name, "launch-process")
+        self.assertEqual(name, "view")
+
+    def test_normal_session_still_uses_the_fast_search(self):
+        available = {"view", "launch-process"}
+        with patch("auggie_launch.config.SESSION_MODE", ""):
+            name, _ = main.codegpt.route_tool_call("file_search", {"pattern": "x"}, available)
+        self.assertEqual(name, "launch-process")
+
+
+class TestModeFeatureFlags(unittest.TestCase):
+    def test_plan_mode_and_personas_are_advertised(self):
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False):
+            flags = main.registry.fake_models()["feature_flags"]
+        self.assertIs(flags.get("cliEnablePlanMode"), True)
+        self.assertIs(flags.get("cliEnablePersona"), True)

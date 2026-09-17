@@ -13,7 +13,7 @@ from .config import load_config, log
 from .doctor import run_doctor
 from .injections import build_injected_environment, generate_injected_mcp_config
 from .proxy import AuggieProxy
-from .server import find_free_port, print_env, print_models, stop_server
+from .server import find_free_port, permissions_for_mode, print_env, print_models, stop_server
 from .upstream import upstream_url
 
 # ============================================================================
@@ -92,6 +92,12 @@ def main() -> None:
         if arg in {"--sessions", "--list-sessions"}:
             launcher_args.append("--sessions")
             continue
+        if arg == "--mode":
+            if not args:
+                print("error: --mode needs one of: plan, code, full-access", file=sys.stderr)
+                sys.exit(2)
+            launcher_args.extend(["--mode", args.pop(0)])
+            continue
         if arg in {
             "--print-env",
             "--proxy-only",
@@ -99,6 +105,7 @@ def main() -> None:
             "--doctor",
             "--models",
             "--sessions",
+            "--mode",
             "--help",
             "-h",
         }:
@@ -116,6 +123,7 @@ def main() -> None:
         print("  -c, --continue              Resume the most recent session")
         print("  --resume [sessionId]        Resume a session (interactive picker without an id)")
         print("  --sessions                  List saved sessions for this workspace")
+        print("  --mode plan|code|full-access  Tool permissions for the session")
         print("  --proxy-only                Run only the local proxy in foreground")
         print("  --help, -h                  Show this help")
         return
@@ -125,6 +133,22 @@ def main() -> None:
 
     if "--check" in launcher_args or "--doctor" in launcher_args:
         sys.exit(run_doctor())
+
+    if "--mode" in launcher_args:
+        mode = launcher_args[launcher_args.index("--mode") + 1]
+        permissions = permissions_for_mode(mode)
+        if permissions is None:
+            print(f"error: unknown mode '{mode}' (expected: plan, code, full-access)", file=sys.stderr)
+            sys.exit(2)
+        # The flag is repeatable, one rule per occurrence -- passing five rules
+        # after a single --permission makes the CLI see five arguments.
+        for rule in permissions:
+            pass_args.extend(["--permission", rule])
+        # The proxy needs it too: a read-only turn must not remap a search onto
+        # a mutating tool, which is what the CLI would then refuse.
+        os.environ["AUGGIE_LAUNCH_MODE"] = mode.strip().lower()
+        config.SESSION_MODE = mode.strip().lower()
+        log(f"mode {mode}: {len(permissions)} tool permission(s) applied")
 
     if "--sessions" in launcher_args:
         print_sessions()

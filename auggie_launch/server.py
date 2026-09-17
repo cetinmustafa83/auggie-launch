@@ -12,6 +12,38 @@ from .models import fetch_upstream_models, model_context_limit
 # ============================================================================
 
 
+# Tools that change the workspace. A planning turn must not run any of them.
+_MUTATING_TOOLS = (
+    "str-replace-editor",
+    "save-file",
+    "remove-files",
+    "launch-process",
+    "git-commit",
+)
+
+
+def permissions_for_mode(mode: str) -> list[str] | None:
+    """Maps a session mode onto `--permission` arguments.
+
+    The CLI takes one `tool:policy` pair per flag and defaults to asking, so a
+    mode is expressed by naming the tools it should not have to ask about:
+
+      plan         read-only -- every mutating tool is denied
+      code         writes allowed, but the shell still asks
+      full-access  nothing asks
+
+    Returns None for an unknown mode so the caller can report it.
+    """
+    normalised = (mode or "").strip().lower().replace("_", "-")
+    if normalised == "plan":
+        return [f"{tool}:deny" for tool in _MUTATING_TOOLS]
+    if normalised == "code":
+        return [f"{tool}:allow" for tool in _MUTATING_TOOLS if tool != "launch-process"]
+    if normalised in {"full-access", "fullaccess", "yolo"}:
+        return [f"{tool}:allow" for tool in _MUTATING_TOOLS]
+    return None
+
+
 def find_free_port() -> int:
     """Binds an ephemeral loopback port and reports it, for `PORT=0`."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -39,7 +71,6 @@ def stop_server(httpd: ThreadingHTTPServer) -> None:
 
 def print_models() -> None:
     """Lists the models this proxy will advertise to the CLI."""
-    from . import codegpt
 
     seen: set[str] = set()
     print("Configured model:")
@@ -47,12 +78,22 @@ def print_models() -> None:
     seen.add(config.TARGET_MODEL)
 
     if config.IS_CODEGPT:
-        print("\nInclusive (economy) models:")
-        for entry in codegpt.load_catalog_models():
-            marker = " (active)" if entry["id"] == config.TARGET_MODEL else ""
-            provider = entry.get("provider") or "?"
-            print(f"  - {entry['id']}  [{provider}]{marker}")
-            seen.add(entry["id"])
+        from . import codegpt as _cg  # local: avoid a cycle at import time
+        for label, tier in (("Included with the subscription", "unlimited"),
+                            ("Metered (draws on the credit allowance)", "metered")):
+            rows = _cg.models_by_tier(tier)
+            if not rows:
+                continue
+            print(f"\n{label}:")
+            for entry in rows:
+                marker = " (active)" if entry["id"] == config.TARGET_MODEL else ""
+                panel = entry.get("panel_name") or entry["id"]
+                alias = f"  (panel: {panel})" if panel != entry["id"] else ""
+                context = f"  {entry['context']:,} ctx" if entry.get("context") else ""
+                print(f"  - {entry['id']}  [{entry['provider']}]{context}{alias}{marker}")
+                seen.add(entry["id"])
+        print("\nOnly one session at a time: the subscription is per-user, so a"
+              "\nsecond concurrent auggie-launch will contend with this one.")
         return
 
     live = fetch_upstream_models()

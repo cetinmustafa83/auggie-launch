@@ -7,6 +7,16 @@ and the project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Session modes: `--mode plan|code|full-access`. They map onto the CLI's
+  repeatable `--permission` flag, and `plan` also propagates to the proxy so a
+  search is not remapped onto a tool the mode denies.
+- `cliEnablePlanMode` and `cliEnablePersona` are now advertised, which is what
+  gates `/plan` (Shift+Tab) and `/persona`.
+- Model tiers: an explicit table (8 included, 3 metered) built by calling each
+  model, because the catalog's `economy` flag marks only two of the included
+  models and misses the rest. Panel names are mapped to catalog ids
+  (`glm-5.3-flash` -> `glm-5.2`, `meta-muse-spark-1.3` -> `muse-spark-1.1`).
+  `--models` now groups by tier and notes the one-session-per-account limit.
 - Parallel tool execution. Auggie's agent loop chooses between
   `executeParallelTools`, `executeParallelSubAgents` and a sequential fallback
   based on `beachheadEnableParallelToolExecution` and `beachheadEnableSubAgentTool`;

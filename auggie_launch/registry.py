@@ -197,6 +197,11 @@ def fake_models() -> dict[str, Any]:
             "enable_prompt_enhancer": True,
             "enable_command_suggestions": True,
             "enable_subagent_support": True,
+            # Plan mode (Shift+Tab / `/plan`) and personas (`/persona`) are gated
+            # off unless advertised; they are how a read-only planning turn and
+            # an edit-only turn are expressed.
+            "cliEnablePlanMode": config.ENABLE_PLAN_MODE,
+            "cliEnablePersona": config.ENABLE_PERSONA,
             # Parallelism is off unless these are advertised: Auggie's agent loop
             # falls back to executeSequTools() without them, which is why
             # independent tool calls were run one at a time.

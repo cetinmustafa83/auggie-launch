@@ -113,6 +113,79 @@ _PROVIDER_ALIASES = {
 }
 
 
+# The catalog's `economy` flag does not match the plan: it marks only two of the
+# models the subscription actually includes, and it is missing models the panel
+# offers outright. This table is the source of truth for tier and access, built
+# from what the account could really call (verified by a live request each).
+#
+#   unlimited -> included in the Pro subscription; no per-request credit
+#   metered   -> callable, but draws on the credit allowance
+#
+# `panel_name` is what the CodeGPT UI shows; `catalog_id` is what the bridge
+# accepts. They differ (`glm-5.3-flash` vs `glm-5.2`), so both are kept.
+_MODEL_TIERS: dict[str, dict[str, Any]] = {
+    "deepseek-v4.1-flash": {"tier": "unlimited", "provider": "openrouter"},
+    "glm-5.2": {"tier": "unlimited", "provider": "fireworksai", "panel_name": "glm-5.3-flash"},
+    "gemini-3.8-flash": {"tier": "unlimited", "provider": "vertexai"},
+    "gpt-5.6-luna": {"tier": "unlimited", "provider": "openrouter"},
+    "minimax-m3": {"tier": "unlimited", "provider": "fireworksai"},
+    "laguna-s-2.1": {"tier": "unlimited", "provider": "openrouter"},
+    "muse-spark-1.1": {"tier": "unlimited", "provider": "openrouter", "panel_name": "meta-muse-spark-1.3"},
+    "gpt-6-astra": {"tier": "metered", "provider": "openrouter"},
+    "claude-fable-5-1": {"tier": "metered", "provider": "openrouter"},
+    "kimi-k3": {"tier": "metered", "provider": "openrouter"},
+}
+
+# Names the panel shows that the bridge does not accept verbatim.
+_PANEL_NAME_ALIASES = {
+    "glm-5.3-flash": "glm-5.2",
+    "meta-muse-spark-1.3": "muse-spark-1.1",
+}
+
+
+def canonical_model_id(name: str) -> str:
+    """Maps a panel-displayed model name onto the id the bridge accepts."""
+    return _PANEL_NAME_ALIASES.get((name or "").strip().lower(), name)
+
+
+def model_tier(model_id: str) -> str:
+    """'unlimited', 'metered', or '' when the model is not in the table."""
+    entry = _MODEL_TIERS.get(canonical_model_id(model_id).lower())
+    return str(entry.get("tier") or "") if isinstance(entry, dict) else ""
+
+
+def models_by_tier(tier: str) -> list[dict[str, Any]]:
+    """Models of one tier, enriched with the catalog's context and capabilities.
+
+    The catalog is asked only for metadata: the tier comes from `_MODEL_TIERS`,
+    because the catalog's own `economy` flag disagrees with the plan.
+    """
+    catalog = {entry["id"].lower(): entry for entry in load_catalog_models()}
+    rows: list[dict[str, Any]] = []
+    for model_id, meta in _MODEL_TIERS.items():
+        if meta.get("tier") != tier:
+            continue
+        info = catalog.get(model_id.lower(), {})
+        rows.append({
+            "id": model_id,
+            "provider": meta.get("provider") or info.get("provider") or "?",
+            "panel_name": meta.get("panel_name") or model_id,
+            "context": int(info.get("context") or 0),
+            "tools": bool(info.get("tools", True)),
+            "vision": bool(info.get("vision", False)),
+        })
+    rows.sort(key=lambda r: (r["provider"], r["id"]))
+    return rows
+
+
+def panel_name_for(model_id: str) -> str:
+    """The name the CodeGPT panel shows for a catalog id."""
+    entry = _MODEL_TIERS.get((model_id or "").lower())
+    if isinstance(entry, dict):
+        return str(entry.get("panel_name") or model_id)
+    return model_id
+
+
 def _catalog_paths() -> list[str]:
     """Candidate locations of the CodeGPT extension's model catalog."""
     home = os.path.expanduser("~")
@@ -176,7 +249,10 @@ def provider_for_model(model_id: str) -> str:
     """Resolves the `X-Provider` value for a model, or "" when unknown."""
     if config.CODEGPT_PROVIDER:
         return config.CODEGPT_PROVIDER
-    wanted = (model_id or "").strip().lower()
+    wanted = canonical_model_id(model_id).strip().lower()
+    tier_entry = _MODEL_TIERS.get(wanted)
+    if isinstance(tier_entry, dict) and tier_entry.get("provider"):
+        return str(tier_entry["provider"])
     for entry in load_catalog_models():
         if entry["id"].lower() == wanted:
             return str(entry.get("provider") or "")
@@ -520,7 +596,12 @@ def route_tool_call(name: str, args: dict[str, Any], available: set[str]) -> tup
         # A search must actually return matches. `view` only lists a directory,
         # which the model reads as "nothing found" and retries forever, so the
         # search is served by a real grep over the workspace.
-        if "launch-process" in available:
+        #
+        # Unless the session is read-only: `--mode plan` denies launch-process, so
+        # remapping a search onto it makes the CLI refuse the call, the model
+        # retry, and the turn spin. Fall back to the read-only tool instead.
+        read_only = (config.SESSION_MODE or "").strip().lower() == "plan"
+        if "launch-process" in available and not read_only:
             pattern = regex_hint or ""
             scope = target if isinstance(target, str) and target and target not in {".", "./"} else "."
             if pattern and _is_file_glob(pattern):
@@ -625,7 +706,7 @@ def adapt_request_body(request: dict[str, Any]) -> dict[str, Any]:
     }
     model_id = request.get("model") or config.TARGET_MODEL
     if isinstance(model_id, str) and model_id:
-        body["modelId"] = model_id
+        body["modelId"] = canonical_model_id(model_id)
 
     tools = request.get("tools")
     if isinstance(tools, list) and tools:
