@@ -1790,3 +1790,58 @@ class TestUsageStats(unittest.TestCase):
 
     def test_module_is_reachable_from_the_package(self):
         self.assertTrue(hasattr(main, "stats"))
+
+
+class TestUsageEstimationStance(unittest.TestCase):
+    """CodeGPT's stream carries no usage object at all -- verified by counting
+    the chunks it sends -- so the numbers come from the proxy's own estimate and
+    the report says so rather than implying they are billing-accurate."""
+
+    def setUp(self):
+        import tempfile
+        self.path = os.path.join(tempfile.mkdtemp(), "stats.json")
+        self._env = patch.dict(os.environ, {"AUGGIE_LAUNCH_STATS_PATH": self.path}, clear=False)
+        self._env.start()
+        main.stats._STATE = None
+        main.stats.reset()
+
+    def tearDown(self):
+        self._env.stop()
+        main.stats._STATE = None
+
+    def test_estimated_usage_is_marked_in_the_report(self):
+        main.stats.record_usage({"prompt_tokens": 100, "completion_tokens": 10}, estimated=True)
+        text = main.stats.format_stats()
+        self.assertIn("100 / 10", text)
+        self.assertIn("estimated", text)
+
+    def test_real_usage_is_not_marked(self):
+        main.stats.record_usage({"prompt_tokens": 5, "completion_tokens": 1}, estimated=False)
+        self.assertNotIn("estimated", main.stats.format_stats())
+
+    def test_estimate_feeds_the_counters(self):
+        # The fallback path: no usage from upstream, so estimate from the prompt.
+        request = {"messages": [{"role": "user", "content": "x" * 400}]}
+        estimate = main.proxy.estimate_usage(request, None)
+        self.assertGreater(estimate["prompt_tokens"], 0)
+
+    def test_usage_ignores_non_dicts(self):
+        main.stats.record_usage(None)
+        main.stats.record_usage("nonsense")
+        self.assertEqual(main.stats.snapshot()["input_tokens"], 0)
+
+    def test_retries_are_counted_with_a_reason(self):
+        main.stats.record_retry("HTTP 429")
+        main.stats.record_retry("transport")
+        main.stats.record_retry("HTTP 429")
+        data = main.stats.snapshot()
+        self.assertEqual(data["retries"], 3)
+        self.assertEqual(data["retries_by_reason"]["HTTP 429"], 2)
+        self.assertIn("retries          3", main.stats.format_stats(data))
+
+    def test_retry_line_is_absent_when_zero(self):
+        self.assertNotIn("retries", main.stats.format_stats())
+
+    def test_error_counter_is_reachable(self):
+        main.stats.record_error("HTTP 401")
+        self.assertEqual(main.stats.snapshot()["errors"], 1)

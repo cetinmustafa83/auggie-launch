@@ -45,6 +45,8 @@ def _empty() -> dict[str, Any]:
         "latency_ms": [],
         "input_tokens": 0,
         "output_tokens": 0,
+        "usage_estimated": False,
+        "retries": 0,
     }
 
 
@@ -142,6 +144,15 @@ def record_error(message: str = "") -> None:
         _flush()
 
 
+def record_retry(reason: str = "") -> None:
+    """Counts an upstream retry, so backoff is visible rather than silent."""
+    with _LOCK:
+        _bump("retries")
+        if reason:
+            _bump_mapping("retries_by_reason", reason[:32])
+        _flush()
+
+
 def record_tool_call(name: str) -> None:
     with _LOCK:
         _bump("tool_calls")
@@ -155,13 +166,21 @@ def record_remap(source: str, target: str) -> None:
         _flush()
 
 
-def record_usage(usage: Any) -> None:
+def record_usage(usage: Any, estimated: bool = False) -> None:
+    """Adds token counts.
+
+    CodeGPT's stream carries no usage object at all, so the proxy's own estimate
+    is what there is. `estimated` records that, so the numbers are not read as
+    billing-accurate when they are a character-count approximation.
+    """
     if not isinstance(usage, dict):
         return
     with _LOCK:
         state = _load()
         state["input_tokens"] = int(state.get("input_tokens") or 0) + int(usage.get("prompt_tokens") or 0)
         state["output_tokens"] = int(state.get("output_tokens") or 0) + int(usage.get("completion_tokens") or 0)
+        if estimated:
+            state["usage_estimated"] = True
         global _dirty
         _dirty = True
         _flush()
@@ -204,7 +223,8 @@ def format_stats(state: dict[str, Any] | None = None) -> str:
     tokens_in = int(data.get("input_tokens") or 0)
     tokens_out = int(data.get("output_tokens") or 0)
     if tokens_in or tokens_out:
-        lines.append(f"  tokens in/out    {tokens_in:,} / {tokens_out:,}")
+        suffix = " (estimated: the stream carries no usage object)" if data.get("usage_estimated") else ""
+        lines.append(f"  tokens in/out    {tokens_in:,} / {tokens_out:,}{suffix}")
 
     sizes = [int(s) for s in (data.get("payload_bytes") or []) if isinstance(s, (int, float))]
     if sizes:
@@ -216,6 +236,8 @@ def format_stats(state: dict[str, Any] | None = None) -> str:
         lines.append(f"  latency          p50 {int(statistics.median(latencies))} ms, "
                      f"max {max(latencies)} ms  (last {len(latencies)})")
 
+    if int(data.get("retries") or 0):
+        lines.append(f"  retries          {data['retries']}")
     tools = _top(data.get("tool_names"))
     if tools:
         lines.append("  tool calls       " + ", ".join(f"{name} ({count})" for name, count in tools))

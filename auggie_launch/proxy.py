@@ -334,10 +334,15 @@ class AuggieProxy(BaseHTTPRequestHandler):
                 if isinstance(fn, dict) and isinstance(fn.get("name"), str):
                     stats_mod.record_tool_call(fn["name"])
             usage_value = data.get("usage") if isinstance(data, dict) else None
-            stats_mod.record_usage(usage_value)
+            stats_mod.record_usage(
+                usage_value if isinstance(usage_value, dict) else estimate_usage(openai_request, None),
+                estimated=not isinstance(usage_value, dict),
+            )
             self.send_json(augment_chat_response(text, str(uuid.uuid4()), openai_request, usage_value, tool_calls))
         except urllib.error.HTTPError as exc:
             raw = compact_upstream_error(exc.msg, max_chars=2000)
+            from . import stats as stats_mod
+            stats_mod.record_error(f"HTTP {exc.code}")
             self.send_json({"error": "upstream_error", "message": raw, "status": exc.code}, status=502 if exc.code in {401, 403} else exc.code)
         except Exception as exc:
             self.send_json({"error": "upstream_error", "message": compact_upstream_error(str(exc))}, status=502)
@@ -355,6 +360,8 @@ class AuggieProxy(BaseHTTPRequestHandler):
             upstream_wrapper = open_upstream_with_retries(json_bytes(openai_request), stream=True, timeout=int(config.UPSTREAM_TIMEOUT_SECONDS), label="stream")
         except urllib.error.HTTPError as exc:
             msg = compact_upstream_error(exc.msg, max_chars=2000)
+            from . import stats as stats_mod
+            stats_mod.record_error(f"HTTP {exc.code}")
             self.send_json({"error": "upstream_error", "message": msg, "status": exc.code, "request_id": request_id}, status=502 if exc.code in {401, 403} else exc.code)
             return
         except Exception as exc:
@@ -462,6 +469,8 @@ class AuggieProxy(BaseHTTPRequestHandler):
 
         except Exception as exc:
             if not client_disconnected:
+                from . import stats as stats_mod
+                stats_mod.record_error(type(exc).__name__)
                 write_chunk({"error": "upstream_error", "message": compact_upstream_error(str(exc)), "request_id": request_id})
         finally:
             if in_thinking_block and not client_disconnected:
@@ -471,6 +480,12 @@ class AuggieProxy(BaseHTTPRequestHandler):
             if not client_disconnected:
                 from . import stats as stats_mod
                 stats_mod.record_latency(time.time() - started)
+                # CodeGPT sends no usage object, so fall back to the same
+                # estimate used for the Augment-facing token_usage, flagged as such.
+                stats_mod.record_usage(
+                    usage if isinstance(usage, dict) else estimate_usage(openai_request, None),
+                    estimated=not isinstance(usage, dict),
+                )
                 for call in tool_calls:
                     fn = call.get("function") if isinstance(call, dict) else None
                     if isinstance(fn, dict) and isinstance(fn.get("name"), str):

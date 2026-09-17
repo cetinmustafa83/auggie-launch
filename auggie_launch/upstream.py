@@ -390,6 +390,8 @@ def open_upstream_with_retries(data: bytes, *, stream: bool, timeout: int, label
             _CONNECTION_POOL.release(parsed_url, conn, reusable=False)
 
             if is_retryable_upstream_status(response.status) and attempt < max_attempts - 1:
+                from . import stats as stats_mod
+                stats_mod.record_retry(f"HTTP {response.status}")
                 continue
             if response.status in (401, 402) and attempt < min(len(config.API_KEYS), max_attempts) - 1:
                 continue
@@ -399,6 +401,8 @@ def open_upstream_with_retries(data: bytes, *, stream: bool, timeout: int, label
             last_error = exc
             _CONNECTION_POOL.release(parsed_url, conn, reusable=False)
             if attempt < max_attempts - 1:
+                from . import stats as stats_mod
+                stats_mod.record_retry("transport")
                 apply_upstream_cooldown(retry_backoff_seconds(attempt), "transport error")
                 continue
             break
