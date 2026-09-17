@@ -7,6 +7,9 @@ and the project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- The inclusive-model list is read live from the CodeGPT extension's catalog
+  (context window, tool and vision support included) instead of being pinned in
+  this repo, and `X-Provider` is derived from each model automatically.
 - CodeGPT Plus inclusive ("economy") models: the bridge is
   `POST /chat/tools/<harness>` addressed by `modelId`, with the model's upstream
   in an `X-Provider` header. No agent is involved, so deepseek-v4.1-flash and the

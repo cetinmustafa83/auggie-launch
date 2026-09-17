@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from typing import Any
 
@@ -82,36 +81,11 @@ def codegpt_model_ids() -> list[str]:
     Falls back to the known plan list so Auggie always has something to pick
     even when the CodeGPT extension has not been opened on this machine yet.
     """
-    # The inclusive ("economy") tier: unlimited, and usable with no agent.
-    fallback = [
-        "deepseek-v4.1-flash",
-        "deepseek-v4-flash",
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "ox-alpha",
-    ]
-    path = os.path.expanduser("~/.codegpt/db.sqlite")
-    if not os.path.exists(path):
-        return fallback
-    try:
-        import sqlite3
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
-            row = con.execute("SELECT value FROM kv WHERE key LIKE 'agents-%' LIMIT 1").fetchone()
-        finally:
-            con.close()
-        if row and row[0]:
-            data = json.loads(row[0])
-            agents = data.get("agents") if isinstance(data, dict) else None
-            if isinstance(agents, list):
-                models = [a.get("model") for a in agents if isinstance(a, dict) and a.get("model")]
-                if models:
-                    return list(dict.fromkeys([*models, *fallback]))
-    except Exception:
-        pass
-    return fallback
+    # The inclusive ("economy") tier, read live from the CodeGPT catalog so the
+    # list follows the plan instead of being pinned here.
+    from . import codegpt
 
+    return [entry["id"] for entry in codegpt.load_catalog_models()]
 
 def fake_models() -> dict[str, Any]:
     """Builds comprehensive model list including all 9router combos, aliases, and catalog."""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -93,6 +94,86 @@ def session_field(name: str, env_value: str) -> str:
     return str(value or "").strip()
 
 
+# `serve.upstream` values differ from the `X-Provider` header values CodeGPT
+# accepts; Vertex is the only one that is renamed.
+_PROVIDER_ALIASES = {
+    "vertex": "vertexai",
+    "vertexai": "vertexai",
+    "google": "gemini",
+    "googleaistudio": "gemini",
+}
+
+
+def _catalog_paths() -> list[str]:
+    """Candidate locations of the CodeGPT extension's model catalog."""
+    home = os.path.expanduser("~")
+    ext_root = os.path.join(home, ".vscode", "extensions")
+    paths: list[str] = []
+    if os.path.isdir(ext_root):
+        try:
+            for entry in sorted(os.listdir(ext_root)):
+                if entry.startswith("danielsanmedium.dscodegpt"):
+                    paths.append(os.path.join(ext_root, entry, "standalone", "config", "remote-data", "model-catalog.json"))
+        except OSError:
+            pass
+    return paths
+
+
+def load_catalog_models() -> list[dict[str, Any]]:
+    """Reads the inclusive ("economy") models from the extension's catalog.
+
+    The catalog is refreshed by the extension, so reading it keeps the model
+    list current without shipping a hardcoded copy. Falls back to the last known
+    plan list when the extension has never been installed on this machine.
+    """
+    for path in _catalog_paths():
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, dict):
+            continue
+        out: list[dict[str, Any]] = []
+        for name, info in models.items():
+            if not isinstance(info, dict) or not info.get("economy"):
+                continue
+            upstream = str((info.get("serve") or {}).get("upstream") or "")
+            provider = _PROVIDER_ALIASES.get(upstream.lower(), upstream.lower())
+            out.append({
+                "id": name,
+                "provider": provider,
+                "wire_id": str((info.get("serve") or {}).get("wireId") or ""),
+                "context": int(info.get("contextWindow") or 0),
+                "max_output": int(info.get("maxOutput") or 0),
+                "tools": bool(info.get("tools")),
+                "vision": bool(info.get("vision")),
+            })
+        if out:
+            out.sort(key=lambda m: (not m["tools"], m["id"]))
+            return out
+    return [
+        {"id": "deepseek-v4.1-flash", "provider": "openrouter", "context": 1048576, "tools": True, "vision": False},
+        {"id": "deepseek-v4-flash", "provider": "openrouter", "context": 0, "tools": True, "vision": False},
+        {"id": "gemini-3.8-flash", "provider": "vertexai", "context": 1048576, "tools": True, "vision": True},
+        {"id": "gemini-3.7-flash", "provider": "vertexai", "context": 1000000, "tools": True, "vision": True},
+        {"id": "gemini-3.6-flash", "provider": "vertexai", "context": 1000000, "tools": True, "vision": True},
+        {"id": "ox-alpha", "provider": "openrouter", "context": 1310720, "tools": True, "vision": False},
+    ]
+
+
+def provider_for_model(model_id: str) -> str:
+    """Resolves the `X-Provider` value for a model, or "" when unknown."""
+    if config.CODEGPT_PROVIDER:
+        return config.CODEGPT_PROVIDER
+    wanted = (model_id or "").strip().lower()
+    for entry in load_catalog_models():
+        if entry["id"].lower() == wanted:
+            return str(entry.get("provider") or "")
+    return ""
+
+
 def chat_path(has_tools: bool = True) -> str:
     """The CodeGPT Plus free-tier bridge path.
 
@@ -112,8 +193,10 @@ def extra_headers() -> dict[str, str]:
         "codegpt-version": config.CODEGPT_VERSION,
     }
     # Required by the inclusive-model endpoint; it names the model's upstream.
-    if config.CODEGPT_PROVIDER:
-        headers["X-Provider"] = config.CODEGPT_PROVIDER
+    # Resolved from the catalog per model unless pinned by configuration.
+    provider = provider_for_model(config.TARGET_MODEL)
+    if provider:
+        headers["X-Provider"] = provider
     token = session_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"

@@ -1119,3 +1119,73 @@ class TestStreamedToolCallRemap(unittest.TestCase):
             resolved = main.proxy.resolve_tool_calls(_REMAP_REQUEST, deltas)
         self.assertEqual(resolved[0]["function"]["name"], "view")
         self.assertEqual(json.loads(resolved[0]["function"]["arguments"]), {"path": "a.py"})
+
+
+
+_CATALOG = {
+        "models": {
+            "deepseek-v4.1-flash": {"economy": True, "serve": {"upstream": "openrouter"}, "contextWindow": 1048576, "tools": True},
+            "gemini-3.8-flash": {"economy": True, "serve": {"upstream": "vertex"}, "contextWindow": 1000000, "tools": True, "vision": True},
+            "gpt-5.6-luna": {"economy": False, "serve": {"upstream": "openai"}, "contextWindow": 200000},
+        }
+    }
+
+class TestDynamicCatalog(unittest.TestCase):
+    """The inclusive-model list is read from the CodeGPT extension's catalog so
+    it follows the plan instead of being pinned in this repo."""
+
+    def _with_catalog(self):
+        import tempfile
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "model-catalog.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(_CATALOG, fh)
+        return path
+
+    def test_only_economy_models_are_returned(self):
+        path = self._with_catalog()
+        with patch.object(main.codegpt, "_catalog_paths", return_value=[path]):
+            models = main.codegpt.load_catalog_models()
+        ids = [m["id"] for m in models]
+        self.assertIn("deepseek-v4.1-flash", ids)
+        self.assertIn("gemini-3.8-flash", ids)
+        self.assertNotIn("gpt-5.6-luna", ids)
+
+    def test_context_and_capabilities_are_carried(self):
+        path = self._with_catalog()
+        with patch.object(main.codegpt, "_catalog_paths", return_value=[path]):
+            models = {m["id"]: m for m in main.codegpt.load_catalog_models()}
+        self.assertEqual(models["deepseek-v4.1-flash"]["context"], 1048576)
+        self.assertTrue(models["gemini-3.8-flash"]["vision"])
+
+    def test_upstream_is_translated_to_a_provider_header(self):
+        path = self._with_catalog()
+        with patch.object(main.codegpt, "_catalog_paths", return_value=[path]):
+            models = {m["id"]: m for m in main.codegpt.load_catalog_models()}
+        self.assertEqual(models["deepseek-v4.1-flash"]["provider"], "openrouter")
+        # Vertex is the one upstream whose header name differs.
+        self.assertEqual(models["gemini-3.8-flash"]["provider"], "vertexai")
+
+    def test_missing_catalog_falls_back_to_the_known_plan_list(self):
+        with patch.object(main.codegpt, "_catalog_paths", return_value=["/nonexistent/model-catalog.json"]):
+            models = main.codegpt.load_catalog_models()
+        ids = [m["id"] for m in models]
+        self.assertIn("deepseek-v4.1-flash", ids)
+        self.assertTrue(all(m.get("provider") for m in models))
+
+    def test_provider_for_model_prefers_the_explicit_setting(self):
+        with patch("auggie_launch.config.CODEGPT_PROVIDER", "anthropic"):
+            self.assertEqual(main.codegpt.provider_for_model("anything"), "anthropic")
+
+    def test_provider_for_model_reads_the_catalog(self):
+        path = self._with_catalog()
+        with patch("auggie_launch.config.CODEGPT_PROVIDER", ""), \
+             patch.object(main.codegpt, "_catalog_paths", return_value=[path]):
+            self.assertEqual(main.codegpt.provider_for_model("deepseek-v4.1-flash"), "openrouter")
+            self.assertEqual(main.codegpt.provider_for_model("nope"), "")
+
+    def test_registry_models_come_from_the_catalog(self):
+        path = self._with_catalog()
+        with patch.object(main.codegpt, "_catalog_paths", return_value=[path]):
+            ids = main.registry.codegpt_model_ids()
+        self.assertIn("deepseek-v4.1-flash", ids)
