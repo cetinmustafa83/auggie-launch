@@ -182,7 +182,7 @@ def current_message_text(body: Any) -> str:
 
 
 def build_system_prompt() -> str:
-    """Combines custom system prompt with 9router Caveman mode instructions if enabled."""
+    """Combines the custom prompt with the language rule."""
     parts: list[str] = []
     base_prompt = os.environ.get("AUGGIE_LAUNCH_SYSTEM_PROMPT", "").strip()
     if base_prompt:
@@ -197,14 +197,6 @@ def build_system_prompt() -> str:
             "Use the same language the user writes in unless told otherwise."
         )
 
-    # Caveman mode is a 9router feature; it would only add noise on other upstreams.
-    if config.ROUTER_CAVEMAN_MODE and config.IS_9ROUTER:
-        if config.ROUTER_CAVEMAN_LEVEL == "ultra":
-            parts.append("Respond with maximum brevity. Output only working code and essential commands. Omit pleasantries, conversational intro/outro, and obvious explanations.")
-        elif config.ROUTER_CAVEMAN_LEVEL == "lite":
-            parts.append("Be concise and direct. Keep code explanations brief.")
-        else:
-            parts.append("Keep answers brief, code-focused, and eliminate conversational filler.")
 
     return "\n\n".join(parts)
 

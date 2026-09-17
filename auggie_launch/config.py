@@ -3,7 +3,6 @@
 # For learning and research only; any other use is at your own risk.
 """auggie-launch: local Python proxy and launcher for Auggie/Augment Code CLI.
 
-Deeply integrates with 9router (reading ~/.9router local database, combos, aliases,
 catalog, tunnel, and provider keys), provides full injections into Auggie CLI
 (session auth, environment, MCP tools, Caveman ultra instructions, feature flags),
 and forwards chat/completion requests to OpenAI/Claude-compatible upstream endpoints.
@@ -11,18 +10,13 @@ and forwards chat/completion requests to OpenAI/Claude-compatible upstream endpo
 
 from __future__ import annotations
 
-import json
 import os
 import platform
 import subprocess
 import sys
 import tempfile
 import threading
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
-from dataclasses import dataclass, field
 from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,11 +32,10 @@ __version__ = "0.4.0"
 
 # --- Global Configurations ---
 TARGET_BASE_URL = ""
-# Runtime upstream override: set when the local 9router socket dies and the
+# Runtime upstream override (single upstream today)
 # Cloudflare tunnel takes over. Sticky for the process lifetime.
 # lc-debt: no automatic switch back to local once the tunnel takes over; restart to reset.
 ACTIVE_BASE_URL = ""
-TUNNEL_BASE_URL = ""
 BASE_URL_LOCK = threading.Lock()
 TARGET_MODEL = ""
 TARGET_API_KEY = ""
@@ -51,6 +44,11 @@ FROZEN_KEYS: dict[str, float] = {}
 FROZEN_LOCK = threading.Lock()
 AUGGIE_BIN = "auggie"
 LOCAL_TOKEN = "fake-augment-access-token"
+_LOADED_ENV_FILES: list[str] = []
+# Stable per-process identifiers for the Codex-style upstream headers.
+_CODEX_SESSION_ID = f"session-{uuid.uuid4()}"
+_CODEX_THREAD_ID = str(uuid.uuid4())
+_CODEX_INSTALLATION_ID = str(uuid.uuid4())
 VERBOSE = False
 DEBUG_DIR = ""
 PORT = 0
@@ -94,6 +92,18 @@ HISTORY_SUMMARY_TRIGGER_RATIO = 0.6
 HISTORY_SUMMARY_MAX_HISTORY_CHARS = 100000
 HISTORY_SUMMARY_MAX_HISTORY_EXPLICIT = False
 HISTORY_SUMMARY_INPUT_BUDGET_RATIO = 0.6
+
+# --- Upstream model discovery ---
+DYNAMIC_MODELS = True
+USE_COMPLETION_TOKENS = "auto"  # auto | true | false
+ENABLE_CONNECTION_POOL = True
+AUTO_INJECT_MCP = True
+# Cached catalog of upstream model metadata (context windows, capabilities)
+CACHED_CATALOG: dict[str, Any] = {}
+_CACHED_MODELS: list[dict[str, Any]] = []
+_CACHED_MODELS_TIME = 0.0
+_MODELS_CACHE_TTL = 60.0
+_MODELS_LOCK = threading.Lock()
 # --- CodeGPT Plus (agent-backed cloud) specific features ---
 IS_CODEGPT = False
 CODEGPT_SESSION_URL = ""
@@ -109,107 +119,6 @@ CODEGPT_HARNESS = "codegpt"
 CODEGPT_PROVIDER = ""
 CODEGPT_SESSION_ID = ""
 
-# --- 9router & Modern LLM Specific Features ---
-IS_9ROUTER = False
-ROUTER_CAVEMAN_MODE = False
-ROUTER_CAVEMAN_LEVEL = "ultra"
-ROUTER_PROVIDER = ""
-CACHED_CATALOG: dict[str, Any] = {}
-DYNAMIC_MODELS = True
-USE_COMPLETION_TOKENS = "auto"  # auto | true | false
-ENABLE_CONNECTION_POOL = True
-AUTO_INJECT_MCP = True
-
-_LOADED_ENV_FILES: list[str] = []
-_CODEX_SESSION_ID = f"session-{uuid.uuid4()}"
-_CODEX_THREAD_ID = str(uuid.uuid4())
-_CODEX_INSTALLATION_ID = str(uuid.uuid4())
-
-# Cached dynamic model registry from 9router/upstream
-_CACHED_MODELS: list[dict[str, Any]] = []
-_CACHED_MODELS_TIME = 0.0
-_MODELS_CACHE_TTL = 60.0
-_MODELS_LOCK = threading.Lock()
-
-
-# ============================================================================
-# Deep 9router Local State & Discovery Engine
-# ============================================================================
-
-@dataclass
-class NineRouterLocalState:
-    installed: bool = False
-    db_path: str = ""
-    settings: dict[str, Any] = field(default_factory=dict)
-    combos: list[dict[str, Any]] = field(default_factory=list)
-    model_aliases: dict[str, str] = field(default_factory=dict)
-    api_keys: list[str] = field(default_factory=list)
-    provider_connections: list[dict[str, Any]] = field(default_factory=list)
-    provider_api_keys: dict[str, str] = field(default_factory=dict)
-    tunnel_url: str = ""
-    caveman_enabled: bool = False
-    caveman_level: str = "ultra"
-    catalog_models: dict[str, Any] = field(default_factory=dict)
-
-
-def read_local_9router_state() -> NineRouterLocalState:
-    """Reads ~/.9router/db.json and model-catalog.json to treat 9router as part of ourselves."""
-    state = NineRouterLocalState()
-    home = os.path.expanduser("~")
-    nine_dir = os.path.join(home, ".9router")
-    db_file = os.path.join(nine_dir, "db.json")
-    catalog_file = os.path.join(nine_dir, "model-catalog.json")
-
-    if not os.path.isdir(nine_dir) or not os.path.isfile(db_file):
-        return state
-
-    state.installed = True
-    state.db_path = db_file
-
-    try:
-        with open(db_file, encoding="utf-8") as f:
-            data = json.load(f)
-
-        state.settings = data.get("settings") or {}
-        state.combos = data.get("combos") or []
-        state.model_aliases = data.get("modelAliases") or {}
-        state.tunnel_url = (state.settings.get("tunnelUrl") or "").strip()
-        state.caveman_enabled = bool(state.settings.get("cavemanEnabled", False))
-        state.caveman_level = str(state.settings.get("cavemanLevel") or "ultra").strip()
-
-        # Extract active API keys
-        raw_keys = data.get("apiKeys") or []
-        for k in raw_keys:
-            if isinstance(k, dict) and k.get("key") and k.get("isActive", True):
-                state.api_keys.append(str(k["key"]).strip())
-
-        # Extract provider connections and API keys
-        raw_providers = data.get("providerConnections") or []
-        state.provider_connections = raw_providers
-        for p in raw_providers:
-            if not isinstance(p, dict) or not p.get("isActive", True):
-                continue
-            prov_name = str(p.get("provider") or "").lower()
-            key_val = p.get("apiKey") or p.get("accessToken")
-            if prov_name and key_val:
-                state.provider_api_keys[prov_name] = str(key_val).strip()
-
-    except Exception as exc:
-        log(f"error reading local 9router db: {exc}")
-
-    # Read model catalog for capabilities (vision, audio, pdf)
-    if os.path.isfile(catalog_file):
-        try:
-            with open(catalog_file, encoding="utf-8") as f:
-                cat_data = json.load(f)
-                state.catalog_models = cat_data.get("models") or {}
-        except Exception as exc:
-            log(f"error reading local 9router catalog: {exc}")
-
-    return state
-
-
-_LOCAL_9ROUTER = read_local_9router_state()
 
 
 # ============================================================================
@@ -382,25 +291,12 @@ def with_codex_headers(headers: dict[str, str]) -> dict[str, str]:
     return out
 
 
-def detect_9router(url: str) -> bool:
-    """Checks whether the upstream URL is likely 9router."""
-    if env_truthy("AUGGIE_LAUNCH_FORCE_9ROUTER", False):
-        return True
-    try:
-        parsed = urllib.parse.urlparse(url)
-        if parsed.port == 20128:
-            return True
-        if "9router" in parsed.netloc.lower() or "9router" in parsed.path.lower():
-            return True
-    except Exception:
-        pass
-    return False
-
 def load_config() -> None:
     global TARGET_BASE_URL, TARGET_MODEL, TARGET_API_KEY, API_KEYS, AUGGIE_BIN
     global LOCAL_TOKEN, VERBOSE, DEBUG_DIR, PORT, _LOADED_ENV_FILES
     global UPSTREAM_USER_AGENT, UPSTREAM_APP_NAME, SANITIZE_UPSTREAM_PROMPTS
-    global REPLY_LANGUAGE
+    global REPLY_LANGUAGE, STREAM_THINKING, DYNAMIC_MODELS, USE_COMPLETION_TOKENS
+    global ENABLE_CONNECTION_POOL, AUTO_INJECT_MCP, CACHED_CATALOG
     global UPSTREAM_MIN_INTERVAL_SECONDS, UPSTREAM_RETRIES
     global UPSTREAM_429_FREEZE_SECONDS, UPSTREAM_5XX_FREEZE_SECONDS
     global UPSTREAM_MAX_RETRY_AFTER_SECONDS, UPSTREAM_BACKOFF_INITIAL_SECONDS
@@ -408,26 +304,12 @@ def load_config() -> None:
     global INDEXING_MODE, MODEL_CONTEXT_TOKENS, MODEL_MAX_OUTPUT_TOKENS, REASONING_EFFORT
     global MODEL_CONTEXT_TOKENS_EXPLICIT, REQUIRE_LOCAL_TOKEN
     global UPSTREAM_TIMEOUT_SECONDS
-    global STREAM_THINKING, IS_9ROUTER, ROUTER_CAVEMAN_MODE, ROUTER_CAVEMAN_LEVEL
-    global ROUTER_PROVIDER, DYNAMIC_MODELS, USE_COMPLETION_TOKENS, ENABLE_CONNECTION_POOL
-    global CACHED_CATALOG, _LOCAL_9ROUTER, AUTO_INJECT_MCP
+    global DYNAMIC_MODELS, USE_COMPLETION_TOKENS, ENABLE_CONNECTION_POOL
+    global CACHED_CATALOG, AUTO_INJECT_MCP
 
     _LOADED_ENV_FILES = load_dotenv_files()
-    _LOCAL_9ROUTER = read_local_9router_state()
 
     # Read model catalog for capabilities (vision, audio, pdf, context window)
-    home = os.path.expanduser("~")
-    catalog_file = os.path.join(home, ".9router", "model-catalog.json")
-    if os.path.isfile(catalog_file):
-        try:
-            with open(catalog_file, encoding="utf-8") as f:
-                cat_data = json.load(f)
-                global CACHED_CATALOG
-                CACHED_CATALOG = cat_data.get("models", {})
-        except Exception as exc:
-            log(f"error reading local 9router catalog: {exc}")
-
-    # Zero-config auto-detection from 9router local DB if available
     base_url_env = os.environ.get("AUGGIE_LAUNCH_BASE_URL", "").strip()
     if not base_url_env:
         base_url_env = "http://localhost:20128/v1"
@@ -435,19 +317,16 @@ def load_config() -> None:
 
     model_env = os.environ.get("AUGGIE_LAUNCH_MODEL", "").strip()
     if not model_env:
-        model_env = _LOCAL_9ROUTER.combos[0]["name"] if _LOCAL_9ROUTER.combos else "free"
+        model_env = "free"
         os.environ["AUGGIE_LAUNCH_MODEL"] = model_env
 
     key_text = os.environ.get("AUGGIE_LAUNCH_API_KEYS") or os.environ.get("AUGGIE_LAUNCH_API_KEY") or ""
-    if not key_text and _LOCAL_9ROUTER.api_keys:
-        key_text = _LOCAL_9ROUTER.api_keys[0]
-        os.environ["AUGGIE_LAUNCH_API_KEY"] = key_text
 
     API_KEYS = [key.strip() for key in key_text.split(",") if key.strip()]
 
     missing = [key for key in _REQUIRED_KEYS if not (os.environ.get(key) or "").strip()]
     if not API_KEYS:
-        missing.append("AUGGIE_LAUNCH_API_KEY (or 9router active key)")
+        missing.append("AUGGIE_LAUNCH_API_KEY")
     if missing:
         xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
         print("error: missing required configuration: " + ", ".join(missing), file=sys.stderr)
@@ -489,26 +368,9 @@ def load_config() -> None:
         sys.exit(2)
 
     STREAM_THINKING = env_truthy("AUGGIE_LAUNCH_STREAM_THINKING", False)
-    IS_9ROUTER = detect_9router(TARGET_BASE_URL)
-
-    # Auto-install 9router when the system cannot detect it at all
-    if IS_9ROUTER and not _LOCAL_9ROUTER.installed and env_truthy("AUGGIE_LAUNCH_AUTO_INSTALL_9ROUTER", True):
-        from .ninerouter import ensure_9router_installed  # imported here: ninerouter depends on config
-
-        if ensure_9router_installed():
-            _LOCAL_9ROUTER = read_local_9router_state()
-
-    # Tunnel fallback target: 9router's Cloudflare URL + the local base path (e.g. /v1)
-    global TUNNEL_BASE_URL, ACTIVE_BASE_URL
+    # Runtime upstream override (single upstream today; kept for failover)
+    global ACTIVE_BASE_URL
     ACTIVE_BASE_URL = ""
-    TUNNEL_BASE_URL = ""
-    if _LOCAL_9ROUTER.tunnel_url:
-        base_path = urllib.parse.urlparse(TARGET_BASE_URL).path.rstrip("/")
-        TUNNEL_BASE_URL = _LOCAL_9ROUTER.tunnel_url.rstrip("/") + base_path
-
-    ROUTER_CAVEMAN_MODE = env_truthy("AUGGIE_LAUNCH_9ROUTER_CAVEMAN", _LOCAL_9ROUTER.caveman_enabled)
-    ROUTER_CAVEMAN_LEVEL = (os.environ.get("AUGGIE_LAUNCH_9ROUTER_CAVEMAN_LEVEL") or _LOCAL_9ROUTER.caveman_level).strip().lower()
-    ROUTER_PROVIDER = (os.environ.get("AUGGIE_LAUNCH_9ROUTER_PROVIDER") or "").strip()
 
     # CodeGPT Plus: agent-backed cloud that speaks an OpenAI-shaped SSE stream.
     global IS_CODEGPT, CODEGPT_SESSION_URL, CODEGPT_TOKEN, CODEGPT_AGENT_ID, CODEGPT_ORG_ID

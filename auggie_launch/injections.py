@@ -7,6 +7,7 @@ from typing import Any
 
 from . import config
 from .config import log
+from .transform import build_system_prompt
 from .upstream import get_active_key
 
 # ============================================================================
@@ -14,18 +15,17 @@ from .upstream import get_active_key
 # ============================================================================
 
 def provider_key(name: str) -> str:
-    """Resolves a provider API key from the explicit env, then the 9router DB.
+    """Resolves a provider API key from the environment.
 
-    `AUGGIE_LAUNCH_<NAME>_API_KEY` is checked first so MCP servers can be wired
-    up without 9router, then the shared `<NAME>_API_KEY`, then the local 9router
-    state that historically held these keys.
+    `AUGGIE_LAUNCH_<NAME>_API_KEY` is checked first, then the shared
+    `<NAME>_API_KEY`.
     """
     upper = name.upper().replace("-", "_")
     for key in (f"AUGGIE_LAUNCH_{upper}_API_KEY", f"{upper}_API_KEY"):
         value = (os.environ.get(key) or "").strip()
         if value:
             return value
-    return str(config._LOCAL_9ROUTER.provider_api_keys.get(name) or "").strip()
+    return ""
 
 
 def mcp_command(bin_name: str, npx_package: str) -> dict[str, Any]:
@@ -48,7 +48,7 @@ def mcp_command(bin_name: str, npx_package: str) -> dict[str, Any]:
 
 
 def generate_injected_mcp_config() -> str:
-    """Generates an MCP configuration file for Auggie CLI with 9router's tools."""
+    """Generates the MCP configuration file handed to the CLI."""
     home = os.path.expanduser("~")
     mcp_config_path = os.path.join(tempfile.gettempdir(), "auggie_injected_mcp.json")
 
@@ -62,8 +62,7 @@ def generate_injected_mcp_config() -> str:
             "args": [],
         }
 
-    # Tavily Web Search MCP: an explicit env key wins over the 9router DB, so it
-    # also works on a non-9router upstream like CodeGPT.
+    # Tavily Web Search MCP, wired from an explicit env key.
     tavily_key = provider_key("tavily")
     if tavily_key:
         mcp_servers["tavily"] = {
@@ -108,18 +107,11 @@ def build_injected_environment(proxy_url: str) -> dict[str, str]:
     env["AUGMENT_DISABLE_AUTO_UPDATE"] = "1"
     env["AUGMENT_MODEL"] = config.TARGET_MODEL
     env["AUGMENT_USER_AGENT"] = config.UPSTREAM_USER_AGENT
-
-    # 2. 9router Caveman System Prompt Injections
-    instructions_parts = []
-    if config.ROUTER_CAVEMAN_MODE:
-        instructions_parts.append(
-            f"9router Caveman Mode Active ({config.ROUTER_CAVEMAN_LEVEL}): Be concise and direct. "
-            "Output pure code and minimal required explanations to save tokens."
-        )
-    if os.environ.get("AUGMENT_INSTRUCTIONS"):
-        instructions_parts.append(os.environ["AUGMENT_INSTRUCTIONS"])
-    if instructions_parts:
-        env["AUGMENT_INSTRUCTIONS"] = "\n\n".join(instructions_parts)
+    # The extra system prompt the CLI prepends to each request. Built here (not
+    # only upstream-side) so the CLI's own prompt is aware of it too.
+    instructions = build_system_prompt()
+    if instructions:
+        env["AUGMENT_INSTRUCTIONS"] = instructions
 
     # 3. Upstream Provider Standard Injections (for CLI tools & SDKs inside Auggie)
     env["OPENAI_BASE_URL"] = config.TARGET_BASE_URL
@@ -127,53 +119,22 @@ def build_injected_environment(proxy_url: str) -> dict[str, str]:
     env["ANTHROPIC_BASE_URL"] = config.TARGET_BASE_URL
     env["ANTHROPIC_AUTH_TOKEN"] = active_key
 
-    # 4. Explicit provider keys (works without 9router; also forwarded to child tools).
+    # Explicit provider keys, also forwarded to child processes.
     for prov_name, env_names in {
         "tavily": ("TAVILY_API_KEY",),
         "exa": ("EXA_API_KEY",),
         "firecrawl": ("FIRECRAWL_API_KEY",),
     }.items():
         pkey = provider_key(prov_name)
-        if pkey:
-            for env_name in env_names:
-                env.setdefault(env_name, pkey)
+        if not pkey:
+            continue
+        explicit = (os.environ.get(f"AUGGIE_LAUNCH_{prov_name.upper()}_API_KEY") or "").strip()
+        for env_name in env_names:
+            # An explicitly prefixed key is authoritative; otherwise leave a
+            # value the user already exported in place.
+            if explicit or not env.get(env_name):
+                env[env_name] = pkey
 
-    # 5. 9router Provider API Key Injections (all active providers, not just well-known)
-    for prov_name, pkey in config._LOCAL_9ROUTER.provider_api_keys.items():
-        norm = prov_name.lower().replace("-", "_").replace(" ", "_")
-        if norm == "tavily":
-            env["TAVILY_API_KEY"] = pkey
-        elif norm == "firecrawl":
-            env["FIRECRAWL_API_KEY"] = pkey
-        elif norm in ("jina_reader", "jina"):
-            env["JINA_API_KEY"] = pkey
-        elif norm == "minimax":
-            env["MINIMAX_API_KEY"] = pkey
-        elif norm in ("kilocode",):
-            env["KILOCODE_TOKEN"] = pkey
-        elif norm in ("gemini-cli", "gemini"):
-            env["GEMINI_API_KEY"] = pkey
-            env["GOOGLE_API_KEY"] = pkey
-        elif norm == "qoder":
-            env["QODER_TOKEN"] = pkey
-        elif norm == "ollama":
-            env["OLLAMA_API_KEY"] = pkey
-        else:
-            # Generic passthrough: PROVIDER_API_KEY
-            env[f"{norm.upper()}_API_KEY"] = pkey
-
-    # 5. Ensure global npm bin and local bin are on PATH
-    home = os.path.expanduser("~")
-    extra_paths = [
-        os.path.join(home, ".npm-global", "bin"),
-        os.path.join(home, ".local", "bin"),
-        "/usr/local/bin",
-    ]
-    cur_path = env.get("PATH", "")
-    for ep in extra_paths:
-        if os.path.isdir(ep) and ep not in cur_path.split(":"):
-            cur_path = f"{ep}:{cur_path}"
-    env["PATH"] = cur_path
 
     return env
 

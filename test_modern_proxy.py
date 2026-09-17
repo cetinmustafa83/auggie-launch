@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Comprehensive unit and offline test suite for auggie-launch modern LLM & 9router proxy techniques."""
+"""Unit and offline test suite for the auggie-launch proxy."""
 
 import itertools
 import json
 import os
-import shutil
-import socket
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -110,67 +108,22 @@ class TestToolCallMergingAndJSONRepair(unittest.TestCase):
         self.assertEqual(parsed.get("list"), [1, 2])
 
 
-class Test9routerAndModelAdaptation(unittest.TestCase):
-    def test_9router_detection(self):
-        self.assertTrue(main.config.detect_9router("http://localhost:20128/v1"))
-        self.assertTrue(main.config.detect_9router("http://127.0.0.1:20128/v1"))
-        self.assertTrue(main.config.detect_9router("https://my-9router.internal:8080/v1"))
-        self.assertFalse(main.config.detect_9router("https://api.openai.com/v1"))
-
-    def test_completion_tokens_parameter_selection(self):
-        self.assertTrue(main.transform.should_use_completion_tokens("o1-preview"))
-        self.assertTrue(main.transform.should_use_completion_tokens("o3-mini"))
-        self.assertTrue(main.transform.should_use_completion_tokens("claude-3-7-sonnet"))
-        self.assertTrue(main.transform.should_use_completion_tokens("deepseek-r1"))
-        self.assertFalse(main.transform.should_use_completion_tokens("gpt-3.5-turbo"))
-
-    def test_full_jitter_backoff_bounds(self):
-        for attempt in range(5):
-            delay = main.upstream.retry_backoff_seconds(attempt)
-            self.assertGreaterEqual(delay, 0.0)
-            self.assertLessEqual(delay, main.config.UPSTREAM_BACKOFF_MAX_SECONDS)
-
-    def test_9router_headers(self):
-        main.config.IS_9ROUTER = True
-        main.config.ROUTER_CAVEMAN_MODE = True
-        main.config.ROUTER_CAVEMAN_LEVEL = "ultra"
-        main.config.ROUTER_PROVIDER = "anthropic"
-        headers = main.upstream.upstream_headers("test-key", stream=True)
-        self.assertEqual(headers.get("X-Source"), "auggie-launch")
-        self.assertEqual(headers.get("X-RTK"), "true")
-        self.assertEqual(headers.get("X-Caveman-Mode"), "true")
-        self.assertEqual(headers.get("X-Caveman-Level"), "ultra")
-        self.assertEqual(headers.get("X-Router-Provider"), "anthropic")
-        self.assertEqual(headers.get("Connection"), "keep-alive")
 
 
-class TestLocal9routerDiscovery(unittest.TestCase):
-    def test_read_local_9router_state_integration(self):
-        state = main.config.read_local_9router_state()
-        if state.installed:
-            self.assertTrue(state.installed)
-            self.assertTrue(os.path.isfile(state.db_path))
-            self.assertIsInstance(state.combos, list)
-            self.assertIsInstance(state.model_aliases, dict)
-            # Verify "free" combo is present
-            combo_names = [c.get("name") for c in state.combos]
-            self.assertIn("free", combo_names)
-            # Verify aliases present
-            self.assertIn("big-pickle", state.model_aliases)
-            # Verify provider keys
-            self.assertIn("tavily", state.provider_api_keys)
-            self.assertIn("firecrawl", state.provider_api_keys)
-            # Verify tunnel URL
-            self.assertTrue(state.tunnel_url.startswith("https://"))
 
 
 class TestAuggieFullInjections(unittest.TestCase):
     def setUp(self):
-        main.config.TARGET_BASE_URL = "http://127.0.0.1:20128/v1"
+        self._saved = (main.config.TARGET_BASE_URL, main.config.TARGET_MODEL, main.config.API_KEYS, main.config.REPLY_LANGUAGE)
+        main.config.TARGET_BASE_URL = "http://127.0.0.1:50108/v1"
         main.config.TARGET_MODEL = "free"
         main.config.API_KEYS = ["sk-test-mock-key"]
-        main.config.ROUTER_CAVEMAN_MODE = True
-        main.config.ROUTER_CAVEMAN_LEVEL = "ultra"
+        main.config.REPLY_LANGUAGE = "English"
+
+    def tearDown(self):
+        (main.config.TARGET_BASE_URL, main.config.TARGET_MODEL,
+         main.config.API_KEYS, main.config.REPLY_LANGUAGE) = self._saved
+
 
     def test_build_injected_environment(self):
         proxy_url = "http://127.0.0.1:54321"
@@ -187,19 +140,16 @@ class TestAuggieFullInjections(unittest.TestCase):
         self.assertEqual(auth.get("accessToken"), main.config.LOCAL_TOKEN)
         self.assertEqual(auth.get("tenantURL"), proxy_url)
 
-        # Caveman system instructions injection
-        instructions = env.get("AUGMENT_INSTRUCTIONS", "")
-        self.assertIn("Caveman Mode Active (ultra)", instructions)
+        # The extra system prompt reaches the CLI through AUGMENT_INSTRUCTIONS
+        self.assertIn("English", env.get("AUGMENT_INSTRUCTIONS", ""))
 
         # Standard upstream provider endpoints
         self.assertEqual(env.get("OPENAI_BASE_URL"), main.config.TARGET_BASE_URL)
         self.assertEqual(env.get("ANTHROPIC_BASE_URL"), main.config.TARGET_BASE_URL)
         self.assertEqual(env.get("OPENAI_API_KEY"), "sk-test-mock-key")
 
-        # 9router provider keys if installed
-        if main.config._LOCAL_9ROUTER.installed:
-            if "tavily" in main.config._LOCAL_9ROUTER.provider_api_keys:
-                self.assertEqual(env.get("TAVILY_API_KEY"), main.config._LOCAL_9ROUTER.provider_api_keys["tavily"])
+        # Keys come from the environment; an unset one must not be invented.
+        self.assertNotIn("TAVILY_API_KEY", env)
 
         # PATH enhancement
         self.assertIn("/bin", env.get("PATH", ""))
@@ -219,7 +169,6 @@ class TestMockedNetworkOperations(unittest.TestCase):
         main.config.TARGET_BASE_URL = "http://127.0.0.1:20128/v1"
         main.config.TARGET_MODEL = "claude-3-7-sonnet"
         main.config.API_KEYS = ["sk-test-mock-key"]
-        main.config.IS_9ROUTER = True
 
     @patch("auggie_launch.upstream._CONNECTION_POOL.acquire")
     def test_dynamic_models_fetch_mocked(self, mock_acquire):
@@ -288,10 +237,8 @@ class TestMockedNetworkOperations(unittest.TestCase):
         self.assertEqual(registry["gemini-2.5-pro"]["context"], 1000000)
         self.assertIn("deepseek-r1", registry)
         self.assertEqual(registry["deepseek-r1"]["context"], 128000)
-        # Verify 9router local combo is in registry
         self.assertIn("free", registry)
-        # Verify 9router local alias is in registry
-        self.assertIn("big-pickle", registry)
+        self.assertIn("free", registry)
 
     @patch("auggie_launch.upstream._CONNECTION_POOL.acquire")
     def test_auto_parameter_swap_on_400(self, mock_acquire):
@@ -325,227 +272,42 @@ class TestMockedNetworkOperations(unittest.TestCase):
 
 
 
-class Test9routerCatalogContext(unittest.TestCase):
-    def test_lookup_catalog_context_exact_match(self):
-        """Test exact model ID match in catalog."""
-        main.config.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 128000}}
-        self.assertEqual(main.models.lookup_catalog_context("gpt-4o"), 128000)
-
-    def test_lookup_catalog_context_last_segment(self):
-        """Test last segment match for namespaced models."""
-        main.config.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 128000}}
-        self.assertEqual(main.models.lookup_catalog_context("openai/gpt-4o"), 128000)
-
-    def test_lookup_catalog_context_missing_returns_zero(self):
-        """Test missing model returns 0."""
-        main.config.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 128000}}
-        self.assertEqual(main.models.lookup_catalog_context("unknown-model"), 0)
-
-    def test_lookup_catalog_context_empty_catalog(self):
-        """Test empty catalog returns 0."""
-        main.config.CACHED_CATALOG = {}
-        self.assertEqual(main.models.lookup_catalog_context("any-model"), 0)
-
-    def test_model_context_limit_catalog_priority(self):
-        """Test catalog context takes priority over heuristics."""
-        main.config.CACHED_CATALOG = {"gpt-4o": {"contextWindow": 200000}}
-        # Even though heuristic would give 200000, catalog provides same
-        self.assertEqual(main.models.model_context_limit("gpt-4o"), 200000)
-
-    def test_model_context_limit_heuristic_fallback(self):
-        """Test heuristic fallback when model not in catalog."""
-        main.config.CACHED_CATALOG = {}
-        self.assertEqual(main.models.model_context_limit("gemini-2.5-pro"), 1000000)
-        self.assertEqual(main.models.model_context_limit("claude-3.5-sonnet"), 200000)
-        self.assertEqual(main.models.model_context_limit("deepseek-chat"), 128000)
 
 
 class TestProviderApiKeyMapping(unittest.TestCase):
-    def test_build_injected_environment_tavily(self):
-        """Test tavily API key mapping."""
-        with patch.dict(os.environ, {}, clear=True):
-            with patch('auggie_launch.config._LOCAL_9ROUTER', main.config.NineRouterLocalState(provider_api_keys={"tavily": "tvly-test-key"})):
-                env = main.injections.build_injected_environment("http://localhost:50108")
-                self.assertEqual(env.get("TAVILY_API_KEY"), "tvly-test-key")
+    """Provider keys are read from the environment."""
 
-    def test_build_injected_environment_firecrawl(self):
-        """Test firecrawl API key mapping."""
-        with patch.dict(os.environ, {}, clear=True):
-            with patch('auggie_launch.config._LOCAL_9ROUTER', main.config.NineRouterLocalState(provider_api_keys={"firecrawl": "fc-test-key"})):
-                env = main.injections.build_injected_environment("http://localhost:50108")
-                self.assertEqual(env.get("FIRECRAWL_API_KEY"), "fc-test-key")
+    def _env(self, **env):
+        with patch.dict(os.environ, env, clear=True):
+            return main.injections.build_injected_environment("http://localhost:50108")
 
-    def test_build_injected_environment_jina_reader(self):
-        """Test jina-reader API key mapping (hyphen normalized)."""
-        with patch.dict(os.environ, {}, clear=True):
-            with patch('auggie_launch.config._LOCAL_9ROUTER', main.config.NineRouterLocalState(provider_api_keys={"jina-reader": "jina-test-key"})):
-                env = main.injections.build_injected_environment("http://localhost:50108")
-                self.assertEqual(env.get("JINA_API_KEY"), "jina-test-key")
+    def test_tavily_key_is_injected(self):
+        self.assertEqual(self._env(AUGGIE_LAUNCH_TAVILY_API_KEY="tvly-1").get("TAVILY_API_KEY"), "tvly-1")
 
-    def test_build_injected_environment_minimax(self):
-        """Test minimax API key mapping."""
-        with patch.dict(os.environ, {}, clear=True):
-            with patch('auggie_launch.config._LOCAL_9ROUTER', main.config.NineRouterLocalState(provider_api_keys={"minimax": "mm-test-key"})):
-                env = main.injections.build_injected_environment("http://localhost:50108")
-                self.assertEqual(env.get("MINIMAX_API_KEY"), "mm-test-key")
+    def test_shared_key_is_accepted(self):
+        self.assertEqual(self._env(FIRECRAWL_API_KEY="fc-1").get("FIRECRAWL_API_KEY"), "fc-1")
 
-    def test_build_injected_environment_generic_fallback(self):
-        """Test generic {NORM}_API_KEY fallback for unknown providers."""
-        with patch.dict(os.environ, {}, clear=True):
-            with patch('auggie_launch.config._LOCAL_9ROUTER', main.config.NineRouterLocalState(provider_api_keys={"custom-provider": "custom-key"})):
-                env = main.injections.build_injected_environment("http://localhost:50108")
-                self.assertEqual(env.get("CUSTOM_PROVIDER_API_KEY"), "custom-key")
+    def test_explicit_prefix_beats_shared(self):
+        env = self._env(AUGGIE_LAUNCH_EXA_API_KEY="exa-explicit", EXA_API_KEY="exa-shared")
+        self.assertEqual(env.get("EXA_API_KEY"), "exa-explicit")
 
-
-class TestTunnelFallback(unittest.TestCase):
-    @patch("auggie_launch.upstream.socket.socket")
-    def test_tunnel_fallback_ping_success(self, mock_socket_class):
-        """Test tunnel fallback ping returns True on success."""
-        mock_sock = MagicMock()
-        mock_socket_class.return_value = mock_sock
-        state = main.config.NineRouterLocalState()
-        state.tunnel_url = "https://test.example.com"
-        result = main.upstream._ping_tunnel(state.tunnel_url)
-        self.assertTrue(result)
-        mock_sock.connect.assert_called_once_with(("test.example.com", 443))
-
-    @patch("auggie_launch.upstream.socket.socket")
-    def test_tunnel_fallback_ping_failure(self, mock_socket_class):
-        """Test tunnel fallback ping returns False on failure."""
-        mock_sock = MagicMock()
-        mock_sock.connect.side_effect = socket.timeout
-        mock_socket_class.return_value = mock_sock
-        state = main.config.NineRouterLocalState()
-        state.tunnel_url = "https://test.example.com"
-        result = main.upstream._ping_tunnel(state.tunnel_url)
-        self.assertFalse(result)
-
-    def test_tunnel_fallback_ping_invalid_url(self):
-        """Test tunnel fallback ping returns False for invalid URL."""
-        state = main.config.NineRouterLocalState()
-        state.tunnel_url = "not-a-url"
-        result = main.upstream._ping_tunnel(state.tunnel_url)
-        self.assertFalse(result)
-
-
-class TestRuntimeTunnelFailover(unittest.TestCase):
-    def setUp(self):
-        self._saved = (main.config.TARGET_BASE_URL, main.config.ACTIVE_BASE_URL, main.config.TUNNEL_BASE_URL)
-        main.config.TARGET_BASE_URL = "http://localhost:20128/v1"
-        main.config.ACTIVE_BASE_URL = ""
-        main.config.TUNNEL_BASE_URL = "https://tunnel.example.com/v1"
-
-    def tearDown(self):
-        main.config.TARGET_BASE_URL, main.config.ACTIVE_BASE_URL, main.config.TUNNEL_BASE_URL = self._saved
-
-    def test_active_base_url_defaults_to_target(self):
-        self.assertEqual(main.upstream.active_base_url(), "http://localhost:20128/v1")
-        self.assertEqual(main.upstream.upstream_url(), "http://localhost:20128/v1/chat/completions")
-
-    @patch("auggie_launch.upstream._ping_tunnel", return_value=True)
-    def test_switch_to_tunnel_when_reachable(self, _ping):
-        self.assertTrue(main.upstream.switch_to_tunnel("connection refused"))
-        self.assertEqual(main.upstream.active_base_url(), "https://tunnel.example.com/v1")
-        self.assertEqual(main.upstream.upstream_url(), "https://tunnel.example.com/v1/chat/completions")
-        # second call is a no-op once already switched
-        self.assertFalse(main.upstream.switch_to_tunnel("connection refused"))
-
-    @patch("auggie_launch.upstream._ping_tunnel", return_value=False)
-    def test_no_switch_when_tunnel_unreachable(self, _ping):
-        self.assertFalse(main.upstream.switch_to_tunnel("connection refused"))
-        self.assertEqual(main.upstream.active_base_url(), "http://localhost:20128/v1")
-
-    def test_no_switch_without_tunnel_configured(self):
-        main.config.TUNNEL_BASE_URL = ""
-        self.assertFalse(main.upstream.switch_to_tunnel("connection refused"))
-        self.assertEqual(main.upstream.active_base_url(), "http://localhost:20128/v1")
-
-
-class Test9routerInstallAndRestore(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self._saved_backup_dir = main.ninerouter._BUNDLED_DB_BACKUP_DIR
-        main.ninerouter._BUNDLED_DB_BACKUP_DIR = os.path.join(self.tmp, "backups")
-        os.makedirs(main.ninerouter._BUNDLED_DB_BACKUP_DIR)
-        self.backup = os.path.join(main.ninerouter._BUNDLED_DB_BACKUP_DIR, "9router-backup-test.json")
-        with open(self.backup, "w", encoding="utf-8") as f:
-            json.dump({"settings": {"cavemanEnabled": True}, "combos": []}, f)
-        self.home = os.path.join(self.tmp, "home")
-        os.makedirs(self.home)
-
-    def tearDown(self):
-        main.ninerouter._BUNDLED_DB_BACKUP_DIR = self._saved_backup_dir
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_latest_bundled_db_backup(self):
-        self.assertEqual(main.ninerouter.latest_bundled_db_backup(), self.backup)
-
-    def test_restore_creates_db_when_missing(self):
-        with patch("auggie_launch.ninerouter.os.path.expanduser", return_value=self.home):
-            self.assertTrue(main.ninerouter.restore_9router_db())
-        db_file = os.path.join(self.home, ".9router", "db.json")
-        self.assertTrue(os.path.isfile(db_file))
-        with open(db_file, encoding="utf-8") as f:
-            self.assertTrue(json.load(f)["settings"]["cavemanEnabled"])
-
-    def test_restore_skips_existing_db_without_force(self):
-        nine_dir = os.path.join(self.home, ".9router")
-        os.makedirs(nine_dir)
-        db_file = os.path.join(nine_dir, "db.json")
-        with open(db_file, "w", encoding="utf-8") as f:
-            json.dump({"settings": {"keep": True}}, f)
-        with patch("auggie_launch.ninerouter.os.path.expanduser", return_value=self.home):
-            self.assertFalse(main.ninerouter.restore_9router_db())
-            self.assertTrue(main.ninerouter.restore_9router_db(force=True))
-        self.assertTrue(os.path.isfile(db_file + ".bak"))
-        with open(db_file, encoding="utf-8") as f:
-            self.assertTrue(json.load(f)["settings"]["cavemanEnabled"])
-
-    def test_restore_rejects_non_9router_json(self):
-        with open(self.backup, "w", encoding="utf-8") as f:
-            json.dump({"not": "a db"}, f)
-        with patch("auggie_launch.ninerouter.os.path.expanduser", return_value=self.home):
-            self.assertFalse(main.ninerouter.restore_9router_db())
-
-    @patch("auggie_launch.ninerouter.subprocess.run")
-    @patch("auggie_launch.ninerouter.shutil.which", return_value="/usr/local/bin/npm")
-    def test_install_9router_runs_npm_prefer_online(self, _which, mock_run):
-        mock_run.return_value = MagicMock(returncode=0)
-        with patch("auggie_launch.ninerouter.find_9router_binary", return_value="/usr/local/bin/9router"):
-            self.assertTrue(main.ninerouter.install_9router())
-        args = mock_run.call_args[0][0]
-        self.assertEqual(args[1:], ["i", "-g", "9router@latest", "--prefer-online"])
-
-    @patch("auggie_launch.ninerouter.shutil.which", return_value=None)
-    def test_install_9router_without_npm(self, _which):
-        self.assertFalse(main.ninerouter.install_9router())
-
-    @patch("auggie_launch.ninerouter.subprocess.run")
-    @patch("auggie_launch.ninerouter.shutil.which", return_value="/usr/local/bin/npm")
-    def test_install_9router_npm_failure(self, _which, mock_run):
-        mock_run.return_value = MagicMock(returncode=1)
-        self.assertFalse(main.ninerouter.install_9router())
-
-    @patch("auggie_launch.ninerouter.install_9router", return_value=True)
-    @patch("auggie_launch.ninerouter.restore_9router_db", return_value=True)
-    def test_ensure_installs_when_binary_missing(self, mock_restore, mock_install):
-        with patch("auggie_launch.ninerouter.find_9router_binary", side_effect=[None, "/usr/local/bin/9router"]):
-            self.assertTrue(main.ninerouter.ensure_9router_installed())
-        mock_install.assert_called_once()
-        mock_restore.assert_called_once()
+    def test_unset_key_is_not_injected(self):
+        self.assertNotIn("TAVILY_API_KEY", self._env())
 
 
 class TestModelContextInjection(unittest.TestCase):
+    """Context limits come from the cached catalog.
+    AUGGIE_LAUNCH_MODEL_CONTEXT_TOKENS still overrides everything."""
+
     def setUp(self):
         self._saved = (
             main.config.TARGET_MODEL,
             main.config.CACHED_CATALOG,
-            main.config._LOCAL_9ROUTER,
             main.config.MODEL_CONTEXT_TOKENS,
             main.config.MODEL_CONTEXT_TOKENS_EXPLICIT,
             main.config.MODEL_MAX_OUTPUT_TOKENS,
         )
-        main.config.TARGET_MODEL = "free"
+        main.config.TARGET_MODEL = "mid-model"
         main.config.MODEL_CONTEXT_TOKENS = 200000
         main.config.MODEL_CONTEXT_TOKENS_EXPLICIT = False
         main.config.MODEL_MAX_OUTPUT_TOKENS = 16000
@@ -554,66 +316,47 @@ class TestModelContextInjection(unittest.TestCase):
             "small-model": {"contextWindow": 32000},
             "mid-model": {"contextWindow": 128000},
         }
-        main.config._LOCAL_9ROUTER = main.config.NineRouterLocalState(
-            combos=[{"name": "free", "models": ["oc/big-model", "oc/small-model", "oc/mid-model"]}],
-            model_aliases={"fast-alias": "oc/big-model"},
-        )
 
     def tearDown(self):
         (
             main.config.TARGET_MODEL,
             main.config.CACHED_CATALOG,
-            main.config._LOCAL_9ROUTER,
             main.config.MODEL_CONTEXT_TOKENS,
             main.config.MODEL_CONTEXT_TOKENS_EXPLICIT,
             main.config.MODEL_MAX_OUTPUT_TOKENS,
         ) = self._saved
 
-    def test_combo_context_uses_weakest_member(self):
-        """A combo can fall back to any member, so its window is the smallest one."""
-        self.assertEqual(main.models.effective_context_limit("free"), 32000)
+    def test_catalog_supplies_each_context(self):
+        self.assertEqual(main.models.model_context_limit("big-model"), 1000000)
+        self.assertEqual(main.models.model_context_limit("small-model"), 32000)
 
-    def test_alias_context_resolves_through_target(self):
-        self.assertEqual(main.models.effective_context_limit("fast-alias"), 1000000)
+    def test_qualified_id_falls_back_to_its_last_segment(self):
+        self.assertEqual(main.models.model_context_limit("openai/big-model"), 1000000)
+
+    def test_unknown_model_uses_the_default(self):
+        self.assertEqual(main.models.model_context_limit("who-is-this"), 200000)
 
     def test_explicit_env_override_wins(self):
-        main.config.MODEL_CONTEXT_TOKENS = 64000
         main.config.MODEL_CONTEXT_TOKENS_EXPLICIT = True
-        self.assertEqual(main.models.effective_context_limit("free"), 64000)
+        main.config.MODEL_CONTEXT_TOKENS = 64000
+        self.assertEqual(main.models.effective_context_limit("big-model"), 64000)
 
     def test_model_list_entry_budgets_track_context(self):
-        small = main.registry.model_list_entry("small-model", 32000)
-        big = main.registry.model_list_entry("big-model", 1000000)
-        self.assertEqual(small["suggested_prefix_char_count"], 32000)
-        self.assertEqual(big["suggested_prefix_char_count"], 200000)  # capped
-        self.assertEqual(small["suggested_prefix_char_count"], small["suggested_suffix_char_count"])
-
-    def test_fake_models_reports_per_model_context(self):
-        with patch("auggie_launch.config.DYNAMIC_MODELS", False):
-            payload = main.registry.fake_models()
-        self.assertTrue(payload["models"])
-        names = {m["name"] for m in payload["models"]}
-        self.assertIn("free", names)
-        self.assertIn("fast-alias", names)
-        registry = json.loads(payload["feature_flags"]["model_info_registry"])
-        self.assertEqual(registry["free"]["context"], 32000)
-        self.assertEqual(registry["fast-alias"]["context"], 1000000)
-        entry = next(m for m in payload["models"] if m["name"] == "free")
+        entry = main.registry.model_list_entry("small-model", 32000)
         self.assertEqual(entry["suggested_prefix_char_count"], 32000)
-
-    def test_resolve_request_model_honours_known_models(self):
-        self.assertEqual(main.models.resolve_request_model({"model": "fast-alias"}), "fast-alias")
-        self.assertEqual(main.models.resolve_request_model({"model": "who-is-this"}), "free")
-        self.assertEqual(main.models.resolve_request_model({}), "free")
+        self.assertLess(entry["completion_timeout_ms"] / 1000, 300)
 
     def test_build_openai_request_caps_output_tokens(self):
         request = main.transform.build_openai_request(
-            {"model": "free", "message": "hi", "max_tokens": 900000},
+            {"model": "small-model", "message": "hi", "max_tokens": 900000},
             stream=False,
         )
-        self.assertEqual(request["model"], "free")
-        field = "max_completion_tokens" if "max_completion_tokens" in request else "max_tokens"
-        self.assertLessEqual(request[field], main.config.MODEL_MAX_OUTPUT_TOKENS)
+        # `small-model` has a 32k window, so the ceiling is a quarter of it --
+        # the 16k configured maximum must not be handed out wholesale.
+        ceiling = max(256, min(16000, max(1024, 32000 // 4)))
+        self.assertEqual(ceiling, 8000)
+        granted = request.get("max_tokens", request.get("max_completion_tokens"))
+        self.assertEqual(granted, ceiling)
 
 
 class TestLocalProxyAuthorization(unittest.TestCase):
@@ -731,23 +474,7 @@ class TestRegistryModelPicker(unittest.TestCase):
         registry = json.loads(payload["feature_flags"]["model_info_registry"])
         self.assertIn(payload["default_model"], registry)
 
-    def test_9router_models_hidden_when_not_9router(self):
-        with patch("auggie_launch.config.DYNAMIC_MODELS", False), \
-             patch("auggie_launch.config.IS_9ROUTER", False), \
-             patch.object(main.config._LOCAL_9ROUTER, "combos", [{"name": "some-combo", "models": ["a"]}]), \
-             patch.object(main.config._LOCAL_9ROUTER, "model_aliases", {"some-alias": "a"}):
-            names = {m["name"] for m in main.registry.fake_models()["models"]}
-        self.assertNotIn("some-combo", names)
-        self.assertNotIn("some-alias", names)
 
-    def test_9router_models_shown_when_9router(self):
-        with patch("auggie_launch.config.DYNAMIC_MODELS", False), \
-             patch("auggie_launch.config.IS_9ROUTER", True), \
-             patch.object(main.config._LOCAL_9ROUTER, "combos", [{"name": "some-combo", "models": ["a"]}]), \
-             patch.object(main.config._LOCAL_9ROUTER, "model_aliases", {"some-alias": "a"}):
-            names = {m["name"] for m in main.registry.fake_models()["models"]}
-        self.assertIn("some-combo", names)
-        self.assertIn("some-alias", names)
 
 
 
@@ -853,58 +580,6 @@ class TestParallelToolCallMerge(unittest.TestCase):
 
 
 
-class TestToolNameAliases(unittest.TestCase):
-    """Models invent tool names from training data (`file_search`, `bash`).
-    Auggie only knows its own names, so invented calls are remapped."""
-
-    AVAILABLE = frozenset({
-        "codebase-retrieval", "view", "save-file", "str-replace-editor",
-        "launch-process", "web-fetch", "remove-files", "tavily_search_tavily",
-    })
-
-    def test_known_names_pass_through(self):
-        for name in self.AVAILABLE:
-            self.assertEqual(main.codegpt.resolve_tool_name(name, self.AVAILABLE), name)
-
-    def test_invented_names_map_to_real_tools(self):
-        cases = {
-            "read_file": "view",
-            "bash": "launch-process",
-            "write_file": "save-file",
-            "edit_file": "str-replace-editor",
-            "web_search": "tavily_search_tavily",
-            "fetch": "web-fetch",
-            "delete_file": "remove-files",
-        }
-        for invented, expected in cases.items():
-            self.assertEqual(main.codegpt.resolve_tool_name(invented, self.AVAILABLE), expected, invented)
-
-    def test_unknown_name_without_match_is_left_alone(self):
-        self.assertEqual(main.codegpt.resolve_tool_name("totally_made_up", self.AVAILABLE), "totally_made_up")
-
-    def test_alias_not_applied_when_target_missing(self):
-        # `web-fetch` is unavailable here, so the alias must not fire blindly.
-        limited = {"view"}
-        self.assertEqual(main.codegpt.resolve_tool_name("fetch", limited), "fetch")
-
-    def test_adapt_request_body_rewrites_history_tool_calls(self):
-        request = {
-            "messages": [
-                {"role": "user", "content": "search"},
-                {"role": "assistant", "content": None, "tool_calls": [
-                    {"id": "c1", "type": "function", "function": {"name": "file_search", "arguments": "{}"}},
-                ]},
-                {"role": "tool", "tool_call_id": "c1", "content": "hits"},
-            ],
-            "tools": [{"type": "function", "function": {
-                "name": "launch-process", "description": "x",
-                "parameters": {"type": "object", "properties": {}},
-            }}],
-        }
-        body = main.codegpt.adapt_request_body(request)
-        joined = " ".join(str(m.get("content") or "") for m in body["messages"])
-        self.assertIn("launch-process", joined)
-        self.assertNotIn("file_search", joined)
 
 
 
@@ -1135,7 +810,6 @@ class TestDynamicCatalog(unittest.TestCase):
     it follows the plan instead of being pinned in this repo."""
 
     def _with_catalog(self):
-        import tempfile
         directory = tempfile.mkdtemp()
         path = os.path.join(directory, "model-catalog.json")
         with open(path, "w", encoding="utf-8") as fh:
@@ -1233,28 +907,6 @@ class TestSearchPatternDetection(unittest.TestCase):
             self.assertIn(resolved, self.AVAILABLE, name)
 
 
-class TestTerminalCommandAliases(unittest.TestCase):
-    """The plain-shell name the model reaches for most often."""
-
-    AVAILABLE = frozenset({"launch-process", "view", "save-file"})
-
-    def test_shell_name_variants_map_to_launch_process(self):
-        for name in (
-            "execute_terminal_command", "run_terminal_command", "run_terminal_cmd",
-            "terminal_command", "execute_shell", "shell_command", "execute_bash",
-            "execute_command", "bash", "shell", "sh", "terminal", "run",
-        ):
-            self.assertEqual(
-                main.codegpt.resolve_tool_name(name, self.AVAILABLE),
-                "launch-process",
-                name,
-            )
-
-    def test_unmappable_name_is_left_untouched(self):
-        self.assertEqual(
-            main.codegpt.resolve_tool_name("totally_unknown_thing", self.AVAILABLE),
-            "totally_unknown_thing",
-        )
 
 
 
@@ -1275,10 +927,6 @@ class TestContextWindowFromCatalog(unittest.TestCase):
              patch.object(main.codegpt, "load_catalog_models", return_value=[entry]):
             self.assertEqual(main.models.lookup_catalog_context("no-such-model"), 0)
 
-    def test_9router_catalog_still_used_when_not_codegpt(self):
-        with patch("auggie_launch.config.IS_CODEGPT", False), \
-             patch("auggie_launch.config.CACHED_CATALOG", {"free": {"contextWindow": 32000}}):
-            self.assertEqual(main.models.lookup_catalog_context("free"), 32000)
 
 
 class TestSummaryThresholdsScaleWithWindow(unittest.TestCase):
@@ -1369,7 +1017,6 @@ class TestSessionsShortcuts(unittest.TestCase):
     def test_lists_only_the_current_workspace(self):
         import contextlib
         import io
-        import tempfile
         home = tempfile.mkdtemp()
         sessions = os.path.join(home, ".augment", "sessions")
         os.makedirs(sessions)
@@ -1390,7 +1037,6 @@ class TestSessionsShortcuts(unittest.TestCase):
     def test_shows_a_date_and_turn_count(self):
         import contextlib
         import io
-        import tempfile
         home = tempfile.mkdtemp()
         sessions = os.path.join(home, ".augment", "sessions")
         os.makedirs(sessions)
@@ -1410,7 +1056,6 @@ class TestSessionsShortcuts(unittest.TestCase):
     def test_workspace_without_sessions_says_so(self):
         import contextlib
         import io
-        import tempfile
         home = tempfile.mkdtemp()
         os.makedirs(os.path.join(home, ".augment", "sessions"))
         out = io.StringIO()
@@ -1475,3 +1120,80 @@ class TestParallelismFlags(unittest.TestCase):
     def test_hindsight_stays_disabled(self):
         # It would upload the workspace to Augment, contradicting INDEXING_MODE.
         self.assertIs(self._flags().get("enable_hindsight"), False)
+
+class TestToolNameAliases(unittest.TestCase):
+    """Models invent tool names from training data (`file_search`, `bash`).
+    Auggie only knows its own names, so invented calls are remapped."""
+
+    AVAILABLE = frozenset({
+        "codebase-retrieval", "view", "save-file", "str-replace-editor",
+        "launch-process", "web-fetch", "remove-files", "tavily_search_tavily",
+    })
+
+    def test_known_names_pass_through(self):
+        for name in self.AVAILABLE:
+            self.assertEqual(main.codegpt.resolve_tool_name(name, self.AVAILABLE), name)
+
+    def test_invented_names_map_to_real_tools(self):
+        cases = {
+            "read_file": "view",
+            "bash": "launch-process",
+            "write_file": "save-file",
+            "edit_file": "str-replace-editor",
+            "web_search": "tavily_search_tavily",
+            "fetch": "web-fetch",
+            "delete_file": "remove-files",
+        }
+        for invented, expected in cases.items():
+            self.assertEqual(main.codegpt.resolve_tool_name(invented, self.AVAILABLE), expected, invented)
+
+    def test_unknown_name_without_match_is_left_alone(self):
+        self.assertEqual(main.codegpt.resolve_tool_name("totally_made_up", self.AVAILABLE), "totally_made_up")
+
+    def test_alias_not_applied_when_target_missing(self):
+        # `web-fetch` is unavailable here, so the alias must not fire blindly.
+        limited = {"view"}
+        self.assertEqual(main.codegpt.resolve_tool_name("fetch", limited), "fetch")
+
+    def test_adapt_request_body_rewrites_history_tool_calls(self):
+        request = {
+            "messages": [
+                {"role": "user", "content": "search"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "file_search", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "hits"},
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "launch-process", "description": "x",
+                "parameters": {"type": "object", "properties": {}},
+            }}],
+        }
+        body = main.codegpt.adapt_request_body(request)
+        joined = " ".join(str(m.get("content") or "") for m in body["messages"])
+        self.assertIn("launch-process", joined)
+        self.assertNotIn("file_search", joined)
+
+
+class TestTerminalCommandAliases(unittest.TestCase):
+    """The plain-shell name the model reaches for most often."""
+
+    AVAILABLE = frozenset({"launch-process", "view", "save-file"})
+
+    def test_shell_name_variants_map_to_launch_process(self):
+        for name in (
+            "execute_terminal_command", "run_terminal_command", "run_terminal_cmd",
+            "terminal_command", "execute_shell", "shell_command", "execute_bash",
+            "execute_command", "bash", "shell", "sh", "terminal", "run",
+        ):
+            self.assertEqual(
+                main.codegpt.resolve_tool_name(name, self.AVAILABLE),
+                "launch-process",
+                name,
+            )
+
+    def test_unmappable_name_is_left_untouched(self):
+        self.assertEqual(
+            main.codegpt.resolve_tool_name("totally_unknown_thing", self.AVAILABLE),
+            "totally_unknown_thing",
+        )

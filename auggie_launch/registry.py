@@ -5,7 +5,7 @@ import uuid
 from typing import Any
 
 from . import config
-from .models import combo_context_limit, effective_context_limit, fetch_upstream_models
+from .models import effective_context_limit, fetch_upstream_models
 
 # ============================================================================
 # Full Model Registry & Session Injection
@@ -104,14 +104,14 @@ def codegpt_model_ids() -> list[str]:
     return [entry["id"] for entry in codegpt.load_catalog_models()]
 
 def fake_models() -> dict[str, Any]:
-    """Builds comprehensive model list including all 9router combos, aliases, and catalog."""
+    """Builds the model list served to the CLI."""
     target_context = effective_context_limit(config.TARGET_MODEL)
     models_list = [model_list_entry(config.TARGET_MODEL, target_context)]
     model_registry: dict[str, Any] = {
         config.TARGET_MODEL: {
             **model_registry_entry(
                 config.TARGET_MODEL,
-                description=f"{'9router' if config.IS_9ROUTER else 'OpenAI-compatible'} model via auggie-launch",
+                description="Model served through auggie-launch",
             ),
             "context": target_context,
             "maxOutput": config.MODEL_MAX_OUTPUT_TOKENS,
@@ -119,42 +119,6 @@ def fake_models() -> dict[str, Any]:
     }
 
     seen_models: set[str] = {config.TARGET_MODEL}
-
-    # 1. Inject 9router combos from local db.json (only when 9router is the upstream)
-    for combo in (config._LOCAL_9ROUTER.combos if config.IS_9ROUTER else []):
-        cname = combo.get("name")
-        if not cname or cname in seen_models:
-            continue
-        seen_models.add(cname)
-        cmodels = combo.get("models") or []
-        combo_context = combo_context_limit(combo)
-        models_list.append(model_list_entry(cname, combo_context))
-        model_registry[cname] = {
-            **model_registry_entry(
-                cname,
-                description=f"Auto-fallback combo over {len(cmodels)} models: {', '.join(cmodels[:3])}...",
-                group="9router combos",
-            ),
-            "context": combo_context,
-            "maxOutput": config.MODEL_MAX_OUTPUT_TOKENS,
-        }
-
-    # 2. Inject 9router model aliases from local db.json (only when 9router is active)
-    for alias_name, real_target in (config._LOCAL_9ROUTER.model_aliases if config.IS_9ROUTER else {}).items():
-        if not alias_name or alias_name in seen_models:
-            continue
-        seen_models.add(alias_name)
-        alias_context = effective_context_limit(alias_name)
-        models_list.append(model_list_entry(alias_name, alias_context))
-        model_registry[alias_name] = {
-            **model_registry_entry(
-                alias_name,
-                description=f"Alias pointing to {real_target}",
-                group="9router aliases",
-            ),
-            "context": alias_context,
-            "maxOutput": config.MODEL_MAX_OUTPUT_TOKENS,
-        }
 
     # 3. Inject CodeGPT Plus agent models (the agent-backed cloud has no /models)
     if config.IS_CODEGPT:
@@ -188,7 +152,7 @@ def fake_models() -> dict[str, Any]:
             model_registry[mid] = {
                 **model_registry_entry(
                     mid,
-                    description=f"Model from {'9router' if config.IS_9ROUTER else 'upstream'}",
+                    description="Model reported by the upstream",
                     group="upstream",
                 ),
                 "context": mid_context,
@@ -241,7 +205,7 @@ def fake_models() -> dict[str, Any]:
             "cliRecordSummarizationsAndSubagents": True,
         },
         "user_tier": "ENTERPRISE_TIER",
-        "user": {"id": "user_auggie_launch_local", "email": "proxy@9router.local"},
+        "user": {"id": "user_auggie_launch_local", "email": "proxy@auggie-launch.local"},
         "bootstrap_settings": {"repository_allowlist_settings": {"repository_urls": [], "is_deny_list": False}},
     }
 

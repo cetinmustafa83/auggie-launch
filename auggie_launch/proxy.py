@@ -163,7 +163,7 @@ def augment_chat_response(text: str, request_id: str, openai_request: dict[str, 
 
 
 class AuggieProxy(BaseHTTPRequestHandler):
-    server_version = f"auggie-launch/{config.__version__} (9router-native)"
+    server_version = f"auggie-launch/{config.__version__} (codegpt-native)"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -237,11 +237,8 @@ class AuggieProxy(BaseHTTPRequestHandler):
                 "ok": True,
                 "service": "auggie-launch",
                 "version": config.__version__,
-                "router": "9router-native" if config.IS_9ROUTER else "standard",
                 "model": config.TARGET_MODEL,
                 "indexing_mode": config.INDEXING_MODE,
-                "9router_combos": [c.get("name") for c in config._LOCAL_9ROUTER.combos],
-                "caveman": config.ROUTER_CAVEMAN_MODE,
             })
         elif path in {"get-models", "models", "model-config"}:
             self.send_json(fake_models())

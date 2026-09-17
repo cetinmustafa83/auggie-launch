@@ -23,7 +23,6 @@ Options:
   --force-env       Overwrite existing user .env from .env.example
   --no-env          Skip creating user .env
   --skip-cli        Do not auto-install the upstream CLI if missing
-  --skip-9router    Do not install/verify 9router
   --skip-verify     Skip the post-install self-test
   --link            Symlink package auggie-launch instead of a small wrapper
   --pipx            Also install the package into an isolated pipx environment
@@ -40,7 +39,6 @@ FORCE_ENV=0
 SKIP_CLI=0
 NO_ENV=0
 USE_LINK=0
-SKIP_9ROUTER=0
 SKIP_VERIFY=0
 USE_PIPX=0
 MIN_PY_MINOR=10
@@ -52,7 +50,6 @@ while [[ $# -gt 0 ]]; do
     --force-env) FORCE_ENV=1; shift ;;
     --no-env) NO_ENV=1; shift ;;
     --skip-cli) SKIP_CLI=1; shift ;;
-    --skip-9router) SKIP_9ROUTER=1; shift ;;
     --skip-verify) SKIP_VERIFY=1; shift ;;
     --pipx) USE_PIPX=1; shift ;;
     --link) USE_LINK=1; shift ;;
@@ -222,25 +219,6 @@ esac
 
 
 
-ensure_9router() {
-  if [[ "${SKIP_9ROUTER:-0}" -eq 1 ]]; then
-    echo "skip 9router setup (--skip-9router)"
-    return 0
-  fi
-  if have_cmd 9router; then
-    echo "9router present: $(command -v 9router)"
-  else
-    echo
-    echo "missing 9router; installing latest release..."
-    run_npm_global "9router@latest" || {
-      echo "warning: 9router install failed; the launcher can still target any OpenAI-compatible URL" >&2
-      return 0
-    }
-  fi
-  # Seed ~/.9router/db.json from the bundled backup when there is no live DB.
-  PYTHONPATH="$ROOT" python3 -m auggie_launch --restore-9router-db >/dev/null 2>&1 && \
-    echo "restored 9router DB from bundled backup" || true
-}
 
 install_pipx_package() {
   [[ "${USE_PIPX:-0}" -eq 1 ]] || return 0
@@ -264,7 +242,7 @@ verify_install() {
     return 1
   fi
   echo "  [OK] wrapper runs: $WRAPPER"
-  if AUGGIE_LAUNCH_AUTO_INSTALL_9ROUTER=false "$WRAPPER" --print-env >/dev/null 2>&1; then
+  if "$WRAPPER" --print-env >/dev/null 2>&1; then
     echo "  [OK] configuration resolves (--print-env)"
   else
     echo "  [WARN] configuration incomplete; edit $USER_ENV then run: auggie-launch --check"
@@ -272,7 +250,6 @@ verify_install() {
 }
 
 ensure_required_cli
-ensure_9router
 install_pipx_package
 verify_install
 

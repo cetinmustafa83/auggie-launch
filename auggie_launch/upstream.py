@@ -4,7 +4,6 @@ import http.client
 import json
 import random
 import socket
-import sys
 import threading
 import time
 import urllib.error
@@ -14,7 +13,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 from . import config
-from .config import env_truthy, log, with_codex_headers
+from .config import log, with_codex_headers
 
 # ============================================================================
 # HTTP Connection Pooling & Networking
@@ -102,15 +101,6 @@ def upstream_headers(api_key: str, *, stream: bool) -> dict[str, str]:
         from . import codegpt  # local import: codegpt imports config at module load
         headers.update(codegpt.extra_headers())
 
-    # 9router native headers
-    if config.IS_9ROUTER or env_truthy("AUGGIE_LAUNCH_FORCE_9ROUTER", False):
-        headers["X-Source"] = "auggie-launch"
-        headers["X-RTK"] = "true"  # Enable Rust Token Killer compression
-        if config.ROUTER_CAVEMAN_MODE:
-            headers["X-Caveman-Mode"] = "true"
-            headers["X-Caveman-Level"] = config.ROUTER_CAVEMAN_LEVEL
-        if config.ROUTER_PROVIDER:
-            headers["X-Router-Provider"] = config.ROUTER_PROVIDER
 
     return with_codex_headers(headers)
 
@@ -132,23 +122,6 @@ def _ping_tunnel(tunnel_url: str) -> bool:
         return True
     except Exception:
         return False
-
-
-def switch_to_tunnel(reason: str) -> bool:
-    """Fails the live upstream over to the 9router Cloudflare tunnel. True if switched."""
-    if not config.TUNNEL_BASE_URL:
-        return False
-    with config.BASE_URL_LOCK:
-        if active_base_url() == config.TUNNEL_BASE_URL:
-            return False
-        if not _ping_tunnel(config.TUNNEL_BASE_URL):
-            return False
-        config.ACTIVE_BASE_URL = config.TUNNEL_BASE_URL
-    print(
-        f"[auggie-launch] local 9router unreachable ({reason}); failing over to tunnel {config.TUNNEL_BASE_URL}",
-        file=sys.stderr,
-    )
-    return True
 
 
 def upstream_url(has_tools: bool = False) -> str:
@@ -273,7 +246,7 @@ def mark_key_failed(key: str, status_code: int, retry_after: str | None = None) 
 
 
 def log_router_response_headers(headers: dict[str, str] | http.client.HTTPMessage) -> None:
-    """Logs 9router fallback, provider, and rate-limit metadata in verbose mode."""
+    """Logs upstream routing metadata in verbose mode."""
     if not config.VERBOSE:
         return
     items = dict(headers.items()) if hasattr(headers, "items") else dict(headers)
@@ -292,7 +265,7 @@ def log_router_response_headers(headers: dict[str, str] | http.client.HTTPMessag
     if rate_remaining:
         details.append(f"rate_rem={rate_remaining}")
     if details:
-        log(f"9router: {' | '.join(details)}")
+        log(f"upstream: {' | '.join(details)}")
 
 
 class UpstreamResponseWrapper:
@@ -425,12 +398,6 @@ def open_upstream_with_retries(data: bytes, *, stream: bool, timeout: int, label
         except Exception as exc:
             last_error = exc
             _CONNECTION_POOL.release(parsed_url, conn, reusable=False)
-            if switch_to_tunnel(str(exc) or exc.__class__.__name__):
-                parsed_url = urllib.parse.urlparse(upstream_url(has_tools))
-                path_with_query = parsed_url.path or "/chat/completions"
-                if parsed_url.query:
-                    path_with_query += f"?{parsed_url.query}"
-                continue
             if attempt < max_attempts - 1:
                 apply_upstream_cooldown(retry_backoff_seconds(attempt), "transport error")
                 continue

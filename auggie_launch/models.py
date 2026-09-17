@@ -12,11 +12,11 @@ from .config import log
 from .upstream import _CONNECTION_POOL, active_base_url, get_active_key, upstream_headers
 
 # ============================================================================
-# Dynamic Model Registry & 9router Catalog Discovery
+# Dynamic Model Registry & Catalog Discovery
 # ============================================================================
 
 def fetch_upstream_models() -> list[dict[str, Any]]:
-    """Fetches real model list from 9router / upstream /v1/models endpoint."""
+    """Fetches the real model list from the upstream /models endpoint."""
     now = time.time()
     with config._MODELS_LOCK:
         if config._CACHED_MODELS and (now - config._CACHED_MODELS_TIME) < config._MODELS_CACHE_TTL:
@@ -57,9 +57,9 @@ def fetch_upstream_models() -> list[dict[str, Any]]:
 def lookup_catalog_context(model_id: str) -> int:
     """Context window for a model, from whichever catalog is in play.
 
-    9router exposes one; CodeGPT Plus exposes another. The CodeGPT catalog is
-    the only place deepseek's 1M window is stated, and missing it made the proxy
-    inject a 200k limit -- so history compacted far earlier than necessary.
+    The CodeGPT catalog is the only place deepseek's 1M window is stated, and
+    missing it made the proxy inject a 200k limit -- so history compacted far
+    earlier than necessary.
     """
     if config.IS_CODEGPT:
         try:
@@ -90,47 +90,35 @@ def lookup_catalog_context(model_id: str) -> int:
                     return int(ctx2)
     return 0
 
-def combo_context_limit(combo: dict[str, Any]) -> int:
-    """Safe context for a 9router combo: the smallest window across its fallback models.
-
-    A combo can be served by any member, so the usable context is the weakest one;
-    anything larger would 400 as soon as the combo falls back.
-    """
-    members = [m for m in (combo.get("models") or []) if isinstance(m, str)]
-    limits = [model_context_limit(m) for m in members]
-    limits = [limit for limit in limits if limit > 0]
-    if not limits:
-        return config.MODEL_CONTEXT_TOKENS if config.MODEL_CONTEXT_TOKENS > 0 else 200000
-    return min(limits)
-
-
 def effective_context_limit(model_id: str) -> int:
     """Context budget actually used for truncation and injection for one model.
 
     An explicit AUGGIE_LAUNCH_MODEL_CONTEXT_TOKENS always wins (operator override);
-    otherwise combos use their weakest member and everything else uses the catalog.
+    otherwise the catalog decides.
     """
     if config.MODEL_CONTEXT_TOKENS_EXPLICIT and config.MODEL_CONTEXT_TOKENS > 0:
         return config.MODEL_CONTEXT_TOKENS
-    for combo in config._LOCAL_9ROUTER.combos:
-        if combo.get("name") == model_id:
-            return combo_context_limit(combo)
-    alias_target = config._LOCAL_9ROUTER.model_aliases.get(model_id)
-    if alias_target:
-        aliased = model_context_limit(alias_target)
-        if aliased > 0:
-            return aliased
     return model_context_limit(model_id)
 
 
 def known_model_names() -> set[str]:
-    """Every model name the launcher advertises to Auggie."""
+    """Every model name the launcher advertises to the CLI.
+
+    The cached catalog matters as much as the live model list: it is where the
+    per-model context windows live, so a model missing from here silently falls
+    back to the default window and gets truncated too early.
+    """
     names = {config.TARGET_MODEL}
-    names.update(str(c.get("name")) for c in config._LOCAL_9ROUTER.combos if c.get("name"))
-    names.update(config._LOCAL_9ROUTER.model_aliases.keys())
+    names.update(str(key) for key in config.CACHED_CATALOG)
     names.update(
         str(item.get("id")) for item in config._CACHED_MODELS if isinstance(item, dict) and item.get("id")
     )
+    if config.IS_CODEGPT:
+        try:
+            from . import codegpt
+            names.update(entry["id"] for entry in codegpt.load_catalog_models())
+        except Exception:
+            pass
     return names
 
 
@@ -150,7 +138,7 @@ def resolve_request_model(body: Any) -> str:
 
 
 def model_context_limit(model_id: str) -> int:
-    """Heuristic context window for standard and 9router models, with catalog priority."""
+    """Heuristic context window for a model, with catalog priority."""
     catalog_ctx = lookup_catalog_context(model_id)
     if catalog_ctx > 0:
         return catalog_ctx
