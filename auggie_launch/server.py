@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 import socket
+import sys
 import threading
 from http.server import ThreadingHTTPServer
+from typing import Any
 
 from . import config
 from .models import fetch_upstream_models, model_context_limit
@@ -30,7 +33,11 @@ def permissions_for_mode(mode: str) -> list[str] | None:
 
       plan         read-only -- every mutating tool is denied
       code         writes allowed, but the shell still asks
-      full-access  nothing asks
+      full-access  nothing asks, shell included
+
+    Privilege is not escalated by the proxy. In full-access the shell is simply
+    unrestricted, so a `sudo` the model decides it needs is run by the CLI and
+    the terminal prompts for the password. The proxy never sees or stores it.
 
     Returns None for an unknown mode so the caller can report it.
     """
@@ -42,6 +49,89 @@ def permissions_for_mode(mode: str) -> list[str] | None:
     if normalised in {"full-access", "fullaccess", "yolo"}:
         return [f"{tool}:allow" for tool in _MUTATING_TOOLS]
     return None
+
+
+def mode_runs_until_done(mode: str) -> bool:
+    """True when the mode should not stop at a turn limit.
+
+    `--print` is bounded by `--max-turns`; the interactive modes are already
+    unbounded. full-access means "finish the task", so it lifts the ceiling.
+    """
+    return (mode or "").strip().lower().replace("_", "-") in {"full-access", "fullaccess", "yolo"}
+
+
+_SECRET_MARKERS = ("TOKEN", "API_KEY", "SECRET", "PASSWORD", "SIGNED_DISTINCT")
+
+
+def _is_secret_key(name: str) -> bool:
+    """True for environment names whose value must not reach a child process."""
+    upper = name.upper()
+    return any(marker in upper for marker in _SECRET_MARKERS)
+
+
+def post_run_checks() -> list[dict[str, Any]]:
+    """Runs the project's quality gate and returns one row per check.
+
+    Mirrors `make check`: a task is only done when these are green, so the
+    launcher reports them instead of leaving the verdict to the model.
+    """
+    import shlex
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    checks = [
+        ("lint", [sys.executable, "-m", "ruff", "check", "auggie_launch/", "test_modern_proxy.py", "test_install.py"]),
+        ("types", [sys.executable, "-m", "mypy", "auggie_launch/"]),
+        ("tests", [sys.executable, "-m", "unittest", "test_modern_proxy", "test_install"]),
+    ]
+    # A child inherits this process's environment, which carries the live token.
+    # Keep it: a test that dumps os.environ would print it. Nothing the checks
+    # need is secret, so the sensitive keys are dropped first.
+    child_env = {k: v for k, v in os.environ.items() if not _is_secret_key(k)}
+
+    results: list[dict[str, Any]] = []
+    for name, command in checks:
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, cwd=root,
+                                  timeout=300, env=child_env)
+            output = (proc.stdout + proc.stderr).strip()
+            results.append({
+                "name": name,
+                "ok": proc.returncode == 0,
+                "command": " ".join(shlex.quote(part) for part in command),
+                "output": output[-4000:],
+            })
+        except Exception as exc:
+            results.append({
+                "name": name,
+                "ok": False,
+                "command": " ".join(shlex.quote(part) for part in command),
+                "output": f"{type(exc).__name__}: {exc}",
+            })
+    return results
+
+
+def report_post_run_checks(results: list[dict[str, Any]]) -> bool:
+    """Prints the gate and returns True only when everything passed."""
+    if not results:
+        return True
+    print()
+    print("=" * 62)
+    print("post-run checks")
+    print("=" * 62)
+    for row in results:
+        mark = "PASS" if row["ok"] else "FAIL"
+        print(f"  [{mark}] {row['name']}")
+        if not row["ok"]:
+            for line in str(row.get("output") or "").splitlines()[-12:]:
+                print(f"         {line}")
+    failures = [row for row in results if not row["ok"]]
+    print("-" * 62)
+    if failures:
+        print(f"{len(failures)} check(s) FAILED -- fix before treating the task as done")
+        return False
+    print("all checks green")
+    return True
 
 
 def find_free_port() -> int:

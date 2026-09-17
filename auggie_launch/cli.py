@@ -13,7 +13,15 @@ from .config import load_config, log
 from .doctor import run_doctor
 from .injections import build_injected_environment, generate_injected_mcp_config
 from .proxy import AuggieProxy
-from .server import find_free_port, permissions_for_mode, print_env, print_models, stop_server
+from .server import (
+    find_free_port,
+    mode_runs_until_done,
+    permissions_for_mode,
+    print_env,
+    print_models,
+    report_post_run_checks,
+    stop_server,
+)
 from .upstream import upstream_url
 
 # ============================================================================
@@ -123,7 +131,8 @@ def main() -> None:
         print("  -c, --continue              Resume the most recent session")
         print("  --resume [sessionId]        Resume a session (interactive picker without an id)")
         print("  --sessions                  List saved sessions for this workspace")
-        print("  --mode plan|code|full-access  Tool permissions for the session")
+        print("  --mode plan|code|full-access  Tool permissions; full-access lifts the turn limit")
+        print("                              and runs the quality gate when the task ends")
         print("  --proxy-only                Run only the local proxy in foreground")
         print("  --help, -h                  Show this help")
         return
@@ -148,6 +157,13 @@ def main() -> None:
         # a mutating tool, which is what the CLI would then refuse.
         os.environ["AUGGIE_LAUNCH_MODE"] = mode.strip().lower()
         config.SESSION_MODE = mode.strip().lower()
+        if mode_runs_until_done(mode):
+            # Raise the ceiling the only way the CLI allows: its own flag. Passing
+            # --max-turns cannot help, since it only accepts values below the
+            # default and rejects 0 outright.
+            config.AGENT_MAX_ITERATIONS = max(
+                config.AGENT_MAX_ITERATIONS, config.FULL_ACCESS_MAX_ITERATIONS
+            )
         log(f"mode {mode}: {len(permissions)} tool permission(s) applied")
 
     if "--sessions" in launcher_args:
@@ -210,6 +226,14 @@ def main() -> None:
             stop_server(httpd)
         except KeyboardInterrupt:
             pass
+
+    if config.POST_RUN_CHECKS:
+        # Runs after the proxy is down: the gate starts its own processes, and
+        # leaving ours listening made the two collide.
+        from .server import post_run_checks
+        if not report_post_run_checks(post_run_checks()):
+            exit_code = exit_code or 1
+
     sys.exit(exit_code)
 
 

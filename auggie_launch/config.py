@@ -101,6 +101,12 @@ AUTO_INJECT_MCP = True
 ENABLE_PLAN_MODE = True
 # Session mode chosen with --mode; read-only when it is "plan".
 SESSION_MODE = ""
+# Run the project quality gate after the CLI exits.
+POST_RUN_CHECKS = True
+# Turn ceiling handed to the CLI. Its default is 200; full-access raises it so a
+# long task is not cut off mid-way.
+AGENT_MAX_ITERATIONS = 200
+FULL_ACCESS_MAX_ITERATIONS = 10000
 ENABLE_PERSONA = True
 # Cached catalog of upstream model metadata (context windows, capabilities)
 CACHED_CATALOG: dict[str, Any] = {}
@@ -301,7 +307,8 @@ def load_config() -> None:
     global UPSTREAM_USER_AGENT, UPSTREAM_APP_NAME, SANITIZE_UPSTREAM_PROMPTS
     global REPLY_LANGUAGE, STREAM_THINKING, DYNAMIC_MODELS, USE_COMPLETION_TOKENS
     global ENABLE_CONNECTION_POOL, AUTO_INJECT_MCP, CACHED_CATALOG
-    global ENABLE_PLAN_MODE, ENABLE_PERSONA, SESSION_MODE
+    global ENABLE_PLAN_MODE, ENABLE_PERSONA, SESSION_MODE, POST_RUN_CHECKS
+    global AGENT_MAX_ITERATIONS, FULL_ACCESS_MAX_ITERATIONS
     global UPSTREAM_MIN_INTERVAL_SECONDS, UPSTREAM_RETRIES
     global UPSTREAM_429_FREEZE_SECONDS, UPSTREAM_5XX_FREEZE_SECONDS
     global UPSTREAM_MAX_RETRY_AFTER_SECONDS, UPSTREAM_BACKOFF_INITIAL_SECONDS
@@ -413,6 +420,9 @@ def load_config() -> None:
     AUTO_INJECT_MCP = env_truthy("AUGGIE_LAUNCH_AUTO_INJECT_MCP", True)
     ENABLE_PLAN_MODE = env_truthy("AUGGIE_LAUNCH_PLAN_MODE", True)
     SESSION_MODE = (os.environ.get("AUGGIE_LAUNCH_MODE") or "").strip().lower()
+    POST_RUN_CHECKS = env_truthy("AUGGIE_LAUNCH_POST_RUN_CHECKS", True)
+    AGENT_MAX_ITERATIONS = env_int("AUGGIE_LAUNCH_AGENT_MAX_ITERATIONS", 200)
+    FULL_ACCESS_MAX_ITERATIONS = env_int("AUGGIE_LAUNCH_FULL_ACCESS_MAX_ITERATIONS", 10000)
     ENABLE_PERSONA = env_truthy("AUGGIE_LAUNCH_PERSONA", True)
 
     if env_truthy("AUGGIE_LAUNCH_CONFIG_CHECK", True):

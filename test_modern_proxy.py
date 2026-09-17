@@ -1349,3 +1349,74 @@ class TestModeFeatureFlags(unittest.TestCase):
             flags = main.registry.fake_models()["feature_flags"]
         self.assertIs(flags.get("cliEnablePlanMode"), True)
         self.assertIs(flags.get("cliEnablePersona"), True)
+
+
+class TestFullAccessSemantics(unittest.TestCase):
+    """full-access means "finish the task": it lifts the turn ceiling and runs
+    the quality gate afterwards."""
+
+    def test_full_access_runs_until_done(self):
+        self.assertTrue(main.server.mode_runs_until_done("full-access"))
+        self.assertTrue(main.server.mode_runs_until_done("FULL_ACCESS"))
+        self.assertFalse(main.server.mode_runs_until_done("plan"))
+        self.assertFalse(main.server.mode_runs_until_done("code"))
+
+    def test_full_access_allows_every_mutating_tool(self):
+        rules = main.server.permissions_for_mode("full-access")
+        for tool in main.server._MUTATING_TOOLS:
+            self.assertIn(f"{tool}:allow", rules, tool)
+
+    def test_turn_ceiling_is_raised_through_the_flag(self):
+        # --max-turns cannot raise it: the CLI only accepts values below its own
+        # default and rejects 0, so the ceiling travels in feature_flags.
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False), \
+             patch("auggie_launch.config.AGENT_MAX_ITERATIONS", 200):
+            flags = main.registry.fake_models()["feature_flags"]
+        self.assertEqual(flags.get("agent_max_iterations"), 200)
+
+    def test_flag_carries_a_raised_value(self):
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False), \
+             patch("auggie_launch.config.AGENT_MAX_ITERATIONS", 10000):
+            flags = main.registry.fake_models()["feature_flags"]
+        self.assertEqual(flags.get("agent_max_iterations"), 10000)
+
+
+class TestPostRunChecks(unittest.TestCase):
+    """The launcher owns the verdict: a task is done when the gate is green,
+    not when the model says so."""
+
+    def test_secret_keys_are_stripped_from_the_child_environment(self):
+        for name in ("AUGGIE_LAUNCH_CODEGPT_TOKEN", "AUGGIE_LAUNCH_TAVILY_API_KEY",
+                     "AUGGIE_LAUNCH_CODEGPT_SIGNED_DISTINCT_ID", "SOME_PASSWORD"):
+            self.assertTrue(main.server._is_secret_key(name), name)
+        for name in ("PATH", "HOME", "AUGGIE_LAUNCH_MODEL", "LANG"):
+            self.assertFalse(main.server._is_secret_key(name), name)
+
+    def test_report_is_red_when_a_check_fails(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok = main.server.report_post_run_checks([
+                {"name": "lint", "ok": True, "command": "ruff", "output": "clean"},
+                {"name": "tests", "ok": False, "command": "unittest", "output": "1 failure"},
+            ])
+        text = buf.getvalue()
+        self.assertFalse(ok)
+        self.assertIn("[PASS] lint", text)
+        self.assertIn("[FAIL] tests", text)
+        self.assertIn("1 failure", text)
+
+    def test_report_is_green_when_all_pass(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok = main.server.report_post_run_checks([
+                {"name": "lint", "ok": True, "command": "ruff", "output": ""},
+            ])
+        self.assertTrue(ok)
+        self.assertIn("all checks green", buf.getvalue())
+
+    def test_no_checks_means_no_verdict(self):
+        self.assertTrue(main.server.report_post_run_checks([]))

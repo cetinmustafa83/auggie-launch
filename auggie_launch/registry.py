@@ -200,6 +200,9 @@ def fake_models() -> dict[str, Any]:
             # Plan mode (Shift+Tab / `/plan`) and personas (`/persona`) are gated
             # off unless advertised; they are how a read-only planning turn and
             # an edit-only turn are expressed.
+            # The CLI's own turn ceiling. `--max-turns` cannot raise it (it only
+            # accepts values below the default of 200); this flag is the lever.
+            "agent_max_iterations": config.AGENT_MAX_ITERATIONS,
             "cliEnablePlanMode": config.ENABLE_PLAN_MODE,
             "cliEnablePersona": config.ENABLE_PERSONA,
             # Parallelism is off unless these are advertised: Auggie's agent loop
