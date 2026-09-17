@@ -7,6 +7,10 @@ and the project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Session shortcuts: `-c`/`--continue`, `--resume [sessionId]` and
+  `--sessions`. The last two list saved sessions with a timestamp, turn count
+  and workspace filter, mirroring the CLI's own picker (which needs a TTY) so
+  the list is readable from a plain shell.
 - The inclusive-model list is read live from the CodeGPT extension's catalog
   (context window, tool and vision support included) instead of being pinned in
   this repo, and `X-Provider` is derived from each model automatically.

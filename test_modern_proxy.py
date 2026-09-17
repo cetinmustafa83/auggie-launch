@@ -1350,3 +1350,72 @@ class TestGlobVersusContentSearch(unittest.TestCase):
     def test_glob_command_is_quoted(self):
         command = self._command("**/*.py")
         self.assertIn("'*.py'", command)
+
+
+
+class TestSessionsShortcuts(unittest.TestCase):
+    """`--sessions` mirrors the CLI's own picker, which needs a TTY, so the list
+    is also readable from a plain shell."""
+
+    def _make_session(self, directory, session_id, workspace, turns=3, name=""):
+        payload = {"sessionId": session_id, "workspaceRoot": workspace, "chatHistory": [{}] * turns}
+        if name:
+            payload["name"] = name
+        path = os.path.join(directory, f"{session_id}.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        return path
+
+    def test_lists_only_the_current_workspace(self):
+        import contextlib
+        import io
+        import tempfile
+        home = tempfile.mkdtemp()
+        sessions = os.path.join(home, ".augment", "sessions")
+        os.makedirs(sessions)
+        here = tempfile.mkdtemp()
+        elsewhere = tempfile.mkdtemp()
+        self._make_session(sessions, "aaaa-1111", here, turns=5, name="mine")
+        self._make_session(sessions, "bb-2222", elsewhere, turns=9, name="theirs")
+
+        out = io.StringIO()
+        with patch("os.path.expanduser", return_value=home), \
+             patch("os.getcwd", return_value=here), \
+             contextlib.redirect_stdout(out):
+            main.cli.print_sessions()
+        text = out.getvalue()
+        self.assertIn("aaaa-1111", text)
+        self.assertNotIn("bb-2222", text)
+
+    def test_shows_a_date_and_turn_count(self):
+        import contextlib
+        import io
+        import tempfile
+        home = tempfile.mkdtemp()
+        sessions = os.path.join(home, ".augment", "sessions")
+        os.makedirs(sessions)
+        here = tempfile.mkdtemp()
+        self._make_session(sessions, "cccc-3333", here, turns=7)
+
+        out = io.StringIO()
+        with patch("os.path.expanduser", return_value=home), \
+             patch("os.getcwd", return_value=here), \
+             contextlib.redirect_stdout(out):
+            main.cli.print_sessions()
+        text = out.getvalue()
+        # A YYYY-MM-DD HH:MM stamp and the turn count must both be present.
+        self.assertRegex(text, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
+        self.assertIn("7", text)
+
+    def test_workspace_without_sessions_says_so(self):
+        import contextlib
+        import io
+        import tempfile
+        home = tempfile.mkdtemp()
+        os.makedirs(os.path.join(home, ".augment", "sessions"))
+        out = io.StringIO()
+        with patch("os.path.expanduser", return_value=home), \
+             patch("os.getcwd", return_value=tempfile.mkdtemp()), \
+             contextlib.redirect_stdout(out):
+            main.cli.print_sessions()
+        self.assertIn("no saved sessions", out.getvalue())

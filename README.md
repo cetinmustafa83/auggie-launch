@@ -289,6 +289,9 @@ Launcher options:
   --update-9router            Update 9router to the latest npm release
   --restore-9router-db        Restore ~/.9router/db.json from the bundled backup
   --print-env                 Show resolved config
+  -c, --continue              Resume the most recent session
+  --resume [sessionId]        Resume a session (picker when the id is omitted)
+  --sessions                  List saved sessions for this workspace
   --proxy-only                Run only the local proxy in foreground
   --help, -h                  Show this help
 ```
