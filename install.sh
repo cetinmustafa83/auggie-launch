@@ -31,7 +31,7 @@ Options:
 After install:
   1. Edit ~/.config/auggie-launch/.env
   2. Ensure ~/.local/bin is on PATH
-  3. Run: auggie-launch --print "hi"
+  3. Run: auggie-launch --doctor
 EOF
 }
 
@@ -58,8 +58,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-
-
+# Recompute after parsing: --bin-dir / --config-dir may have changed them.
 WRAPPER="$BIN_DIR/auggie-launch"
 USER_ENV="$CONFIG_DIR/.env"
 
@@ -130,33 +129,16 @@ run_npm_global() {
   hash -r 2>/dev/null || true
 }
 
-run_curl_bash() {
-  local url="$1"
-  local label="$2"
-  if ! have_cmd curl && ! have_cmd wget; then
-    echo "error: curl or wget required to install $label" >&2
-    return 1
-  fi
-  echo "installing $label via $url"
-  if have_cmd curl; then
-    curl -fsSL "$url" | bash
-  else
-    wget -qO- "$url" | bash
-  fi
-  ensure_path_bin "${HOME}/.local/bin"
-  ensure_path_bin "${HOME}/.grok/bin"
-  hash -r 2>/dev/null || true
-}
 
 ensure_required_cli() {
-  if [[ "${SKIP_CLI:-0}" -eq 1 ]]; then
-    echo "skip CLI auto-install (--skip-cli)"
-    return 0
-  fi
   ensure_path_bin "${HOME}/.local/bin"
   ensure_path_bin "${BIN_DIR:-${HOME}/.local/bin}"
   if have_cmd "auggie"; then
     echo "CLI present: auggie -> $(command -v auggie 2>/dev/null || command -v auggie)"
+    return 0
+  fi
+  if [[ "${SKIP_CLI:-0}" -eq 1 ]]; then
+    echo "skip CLI auto-install (--skip-cli); 'auggie' is not on PATH"
     return 0
   fi
   echo
@@ -217,9 +199,6 @@ case ":$PATH:" in
     ;;
 esac
 
-
-
-
 install_pipx_package() {
   [[ "${USE_PIPX:-0}" -eq 1 ]] || return 0
   if ! have_cmd pipx; then
@@ -245,7 +224,15 @@ verify_install() {
   if "$WRAPPER" --print-env >/dev/null 2>&1; then
     echo "  [OK] configuration resolves (--print-env)"
   else
-    echo "  [WARN] configuration incomplete; edit $USER_ENV then run: auggie-launch --check"
+    echo "  [WARN] configuration incomplete; edit $USER_ENV"
+    echo "         then run: auggie-launch --doctor   (names the failing check)"
+  fi
+  if [[ "${USE_PIPX:-0}" -eq 1 ]] && have_cmd pipx; then
+    if pipx list 2>/dev/null | grep -q auggie-launch; then
+      echo "  [OK] pipx package installed"
+    else
+      echo "  [WARN] pipx package not listed by 'pipx list'"
+    fi
   fi
 }
 
@@ -255,7 +242,12 @@ verify_install
 
 echo
 echo "Done."
-echo "  1) Edit config:  $USER_ENV"
-echo "  2) Health check: auggie-launch --check"
-echo "  3) Run:          auggie-launch --print \"hi\""
-echo "  4) Proxy only:   auggie-launch --proxy-only"
+if [[ "$NO_ENV" -eq 0 || -f "$USER_ENV" ]]; then
+  echo "  1) Edit config:   $USER_ENV"
+else
+  echo "  1) Create config: $USER_ENV   (was skipped with --no-env)"
+fi
+echo "  2) Check health:  auggie-launch --doctor"
+echo "  3) List models:   auggie-launch --models"
+echo "  4) Run:           auggie-launch --print \"hi\""
+echo "  5) Proxy only:    auggie-launch --proxy-only"
