@@ -7,6 +7,26 @@ and the project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Parallel tool execution. Auggie's agent loop chooses between
+  `executeParallelTools`, `executeParallelSubAgents` and a sequential fallback
+  based on `beachheadEnableParallelToolExecution` and `beachheadEnableSubAgentTool`;
+  neither was advertised, so every independent tool call ran one at a time.
+  Measured after enabling: three to four tool calls start in the same
+  millisecond.
+- Project guidance files: `AGENTS.md`, `.augment/rules/` (two rules, typed
+  `always_apply`), `.augment/commands/` (`/check`, `/ship`, `/debug-launch`) and
+  `.augment/skills/auggie-launch/SKILL.md`. These are read by the CLI itself;
+  the proxy does not intercept them. Verified that the model loads and quotes
+  them.
+- `.gitignore` now keeps those config files while still excluding local Auggie
+  state (`settings.json`, caches).
+
+### Security
+- `~/.augment/prompt-history.jsonl` stores every prompt in plain text with mode
+  644. Two entries contained a live API key; they are redacted and the file is
+  now 600. See the README note: never put a credential in a prompt.
+
+### Added
 - Session shortcuts: `-c`/`--continue`, `--resume [sessionId]` and
   `--sessions`. The last two list saved sessions with a timestamp, turn count
   and workspace filter, mirroring the CLI's own picker (which needs a TTY) so

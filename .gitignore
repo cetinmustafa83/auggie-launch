@@ -3,7 +3,11 @@
 .env.bak.*
 .env.*.bak
 *.log
-.augment/
+# Auggie workspace state (sessions, caches). The shareable config is kept:
+# rules, commands and skills are part of the project, unlike local state.
+.augment/settings.json
+.augment/cache/
+.augment/sessions/
 uv.lock
 # Third-party Augment CLI copy (not part of this project)
 auggie/

@@ -274,6 +274,77 @@ Both return an OpenAI-shaped SSE stream, so Auggie sees no difference.
 
 ---
 
+## Rules, Commands, Skills and Memory
+
+Auggie reads project guidance from the workspace. `auggie-launch` does not
+intercept any of it, so these work exactly as they do against Augment.
+
+### Rules (`always_apply` is the important one)
+
+`.augment/rules/*.md` and `~/.augment/rules/*.md` are loaded automatically. The
+`type` frontmatter decides when a rule applies:
+
+| `type` | When it runs |
+|---|---|
+| `always_apply` | Every turn, automatically |
+| `agent_requested` | When the model decides it is relevant |
+| `manual` | Only when invoked |
+
+```markdown
+---
+name: Python quality gate
+description: Run ruff, mypy and the tests after any Python change
+type: always_apply
+---
+
+<rule body>
+```
+
+Auggie also reads, in this order of precedence: `AGENTS.md`, `CLAUDE.md`,
+`.augment-guidelines`, plus Cursor (`.cursor/rules/`, `.cursorrules`) and
+Windsurf (`.windsurf/rules/`, `.windsurfrules`) equivalents.
+
+### Commands
+
+`.augment/commands/*.md` become `/name` in the CLI. This repo ships three:
+`/check`, `/ship`, `/debug-launch`.
+
+### Skills
+
+`.augment/skills/<name>/SKILL.md` — the filename must be exactly `SKILL.md`, and
+`name` plus `description` are required in the frontmatter, or the skill is
+rejected.
+
+```markdown
+---
+name: auggie-launch proxy
+description: Architecture and failure modes of the local proxy
+type: agent_requested
+---
+```
+
+### Memory
+
+Auggie persists conversations under `~/.augment/`:
+
+| Path | Contents |
+|---|---|
+| `sessions/*.json` | Full transcripts; `auggie-launch --sessions` lists them |
+| `prompt-history.jsonl` | Every prompt you have sent |
+| `task-storage/` | Task state |
+
+**`prompt-history.jsonl` is stored in plain text with mode 644.** Never paste a
+credential into a prompt, and keep the file `chmod 600`. Use `/resume`
+(`auggie-launch --resume`) to continue a past conversation rather than repeating
+its context.
+
+### Deliberately disabled
+
+`enable_hindsight` stays off. It is Augment's cloud code-index engine: enabling
+it would upload this workspace to Augment's servers, contradicting
+`AUGGIE_LAUNCH_INDEXING_MODE=complete`, and the index would be useless anyway
+because requests go to CodeGPT rather than Augment.
+
 ## CLI Options
 
 ```bash

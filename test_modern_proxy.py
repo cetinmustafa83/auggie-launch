@@ -1449,3 +1449,29 @@ class TestLaunchProcessArguments(unittest.TestCase):
     def test_glob_command_also_carries_the_flag(self):
         args = self._args("**/*.py")
         self.assertIs(args["keep_stdin_open"], False)
+
+
+class TestParallelismFlags(unittest.TestCase):
+    """Auggie's agent loop picks its execution strategy from these flags:
+    without them it calls executeSequentialTools() and independent tool calls run
+    one at a time."""
+
+    def _flags(self):
+        with patch("auggie_launch.config.DYNAMIC_MODELS", False):
+            return main.registry.fake_models()["feature_flags"]
+
+    def test_parallel_tool_execution_is_advertised(self):
+        self.assertIs(self._flags().get("beachheadEnableParallelToolExecution"), True)
+
+    def test_subagent_tool_is_advertised(self):
+        self.assertIs(self._flags().get("beachheadEnableSubAgentTool"), True)
+
+    def test_subagent_support_is_advertised(self):
+        self.assertIs(self._flags().get("enable_subagent_support"), True)
+
+    def test_subagent_records_are_summarised(self):
+        self.assertIs(self._flags().get("cliRecordSummarizationsAndSubagents"), True)
+
+    def test_hindsight_stays_disabled(self):
+        # It would upload the workspace to Augment, contradicting INDEXING_MODE.
+        self.assertIs(self._flags().get("enable_hindsight"), False)

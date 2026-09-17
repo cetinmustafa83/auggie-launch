@@ -233,6 +233,12 @@ def fake_models() -> dict[str, Any]:
             "enable_prompt_enhancer": True,
             "enable_command_suggestions": True,
             "enable_subagent_support": True,
+            # Parallelism is off unless these are advertised: Auggie's agent loop
+            # falls back to executeSequTools() without them, which is why
+            # independent tool calls were run one at a time.
+            "beachheadEnableParallelToolExecution": True,
+            "beachheadEnableSubAgentTool": True,
+            "cliRecordSummarizationsAndSubagents": True,
         },
         "user_tier": "ENTERPRISE_TIER",
         "user": {"id": "user_auggie_launch_local", "email": "proxy@9router.local"},

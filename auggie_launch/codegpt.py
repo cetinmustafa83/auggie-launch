@@ -1,3 +1,12 @@
+"""CodeGPT Plus cloud bridge for auggie_launch.
+
+CodeGPT Plus speaks an OpenAI-shaped SSE stream but routes chat through its own
+agent endpoint and authenticates with the short-lived session token served by
+the VS Code extension. This module keeps that token fresh and provides the
+header/body shims (agent routing, flat tool schemas, Gemini-safe message and
+schema repair, tool-name normalization) so the rest of the pipeline can keep
+speaking plain OpenAI.
+"""
 from __future__ import annotations
 
 import json
