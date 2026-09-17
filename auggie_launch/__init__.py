@@ -26,7 +26,6 @@ from .config import (  # noqa: F401
     API_KEYS,
     AUGGIE_BIN,
     BASE_URL_LOCK,
-    CODEGPT_AGENT_ID,
     CODEGPT_HARNESS,
     CODEGPT_ORG_ID,
     CODEGPT_PROVIDER,

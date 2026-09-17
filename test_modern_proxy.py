@@ -1845,3 +1845,48 @@ class TestUsageEstimationStance(unittest.TestCase):
     def test_error_counter_is_reachable(self):
         main.stats.record_error("HTTP 401")
         self.assertEqual(main.stats.snapshot()["errors"], 1)
+
+
+class TestEnvExampleCompleteness(unittest.TestCase):
+    """A setting that exists but is undocumented is a setting nobody finds."""
+
+    def _config_env_names(self) -> set[str]:
+        import re
+        source = open(main.config.__file__, encoding="utf-8").read()
+        names = set(re.findall(r'os\.environ\.get\("(AUGGIE_LAUNCH_[A-Z_]+)"', source))
+        names |= set(re.findall(r'env_\w+\("(AUGGIE_LAUNCH_[A-Z_]+)"', source))
+        return names
+
+    def _documented_names(self) -> set[str]:
+        import re
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(main.config.__file__))), ".env.example")
+        source = open(path, encoding="utf-8").read()
+        return set(re.findall(r"AUGGIE_LAUNCH_[A-Z_]+", source))
+
+    def test_every_read_setting_is_documented(self):
+        missing = self._config_env_names() - self._documented_names()
+        self.assertEqual(missing, set(), f"undocumented: {sorted(missing)}")
+
+    def test_example_has_no_9router_leftovers(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(main.config.__file__))), ".env.example")
+        self.assertNotIn("9router", open(path, encoding="utf-8").read().lower())
+
+    def test_example_does_not_ship_a_real_secret(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(main.config.__file__))), ".env.example")
+        source = open(path, encoding="utf-8").read()
+        for marker in ("tvly-", "session-i2n", "eyJhbGciOiJIUzI1NiJ9.eyJkaXN0"):
+            self.assertNotIn(marker, source, marker)
+
+
+class TestNoDeadAgentConfig(unittest.TestCase):
+    """The economy models need no agent, so the agent id was removed rather than
+    left as a knob that does nothing."""
+
+    def test_agent_id_is_gone(self):
+        self.assertFalse(hasattr(main.config, "CODEGPT_AGENT_ID"))
+
+    def test_agent_id_is_absent_from_the_bridge_body(self):
+        body = main.codegpt.adapt_request_body({
+            "model": "deepseek-v4.1-flash", "messages": [{"role": "user", "content": "hi"}],
+        })
+        self.assertNotIn("agentId", body)
