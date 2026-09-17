@@ -365,6 +365,13 @@ _TOOL_ALIASES = {
     "sh": "launch-process",
     "run_command": "launch-process",
     "execute_command": "launch-process",
+    "execute_terminal_command": "launch-process",
+    "run_terminal_command": "launch-process",
+    "run_terminal_cmd": "launch-process",
+    "terminal_command": "launch-process",
+    "execute_shell": "launch-process",
+    "shell_command": "launch-process",
+    "execute_bash": "launch-process",
     "exec": "launch-process",
     "terminal": "launch-process",
     "run": "launch-process",
@@ -432,6 +439,23 @@ def _looks_like_regex(value: str) -> bool:
     return bool(re.search(r"\S+\.\w{1,5}\b|\w+\s*[:=]", value))
 
 
+def _is_file_glob(pattern: str) -> bool:
+    """True for a filename pattern (which needs find) rather than a content regex.
+
+    A wildcard is required. A bare separator is not enough: "a/b" is a search
+    term, and "a; rm -rf /" is a shell payload, not a filename -- routing either
+    to find would misread the intent.
+    """
+    if not pattern or not any(ch in pattern for ch in ("*", "?")):
+        return False
+    if pattern.startswith("*.") or pattern.endswith(".*"):
+        return True
+    if pattern in {"*", "**"}:
+        return True
+    unsafe = any(ch in pattern for ch in (" ", ";", "|", "&", "$", "`", ">", "<"))
+    return "/" in pattern and not unsafe
+
+
 def shell_quote(value: str) -> str:
     """Single-quotes a value for safe interpolation into a shell command."""
     return "'" + str(value).replace("'", "'\\''") + "'"
@@ -447,7 +471,13 @@ def route_tool_call(name: str, args: dict[str, Any], available: set[str]) -> tup
     the arguments rather than a fixed mapping.
     """
     lowered = name.lower()
-    is_search = lowered in {"file_search", "search_files", "grep_search", "grep", "code_search", "search", "find_files", "find"}
+    # Pattern-based so unseen spellings are still recognised: a model may emit
+    # glob_search, search_files, codebase_search, ... anything search-shaped.
+    is_search = (
+        lowered in {"search", "grep", "glob", "find"}
+        or lowered.endswith(("_search", "_glob", "_grep", "_find"))
+        or lowered.startswith(("search_", "glob_", "grep_", "find_"))
+    )
 
     if is_search and name not in available:
         regex_hint = ""
@@ -483,7 +513,17 @@ def route_tool_call(name: str, args: dict[str, Any], available: set[str]) -> tup
         if "launch-process" in available:
             pattern = regex_hint or ""
             scope = target if isinstance(target, str) and target and target not in {".", "./"} else "."
-            if pattern:
+            if pattern and _is_file_glob(pattern):
+                # A glob asks which files exist, not what they contain. Handing
+                # "**/*.py" to grep exits non-zero and reports nothing, which the
+                # model reads as a dead end.
+                name = pattern.rsplit("/", 1)[-1]
+                if not name or name in {"*", "**"}:
+                    name = "*"
+                elif not name.startswith("*"):
+                    name = f"*{name}"
+                command = f"find {shell_quote(scope)} -type f -name {shell_quote(name)}"
+            elif pattern:
                 command = f"grep -rn -- {shell_quote(pattern)} {shell_quote(scope)}"
             else:
                 command = f"ls -la {shell_quote(scope)}"

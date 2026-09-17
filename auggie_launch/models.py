@@ -55,7 +55,21 @@ def fetch_upstream_models() -> list[dict[str, Any]]:
 
 
 def lookup_catalog_context(model_id: str) -> int:
-    """Get context window from 9router model-catalog.json, fallback to heuristic."""
+    """Context window for a model, from whichever catalog is in play.
+
+    9router exposes one; CodeGPT Plus exposes another. The CodeGPT catalog is
+    the only place deepseek's 1M window is stated, and missing it made the proxy
+    inject a 200k limit -- so history compacted far earlier than necessary.
+    """
+    if config.IS_CODEGPT:
+        try:
+            from . import codegpt
+            wanted = (model_id or "").split("/")[-1].strip().lower()
+            for entry in codegpt.load_catalog_models():
+                if entry["id"].lower() == wanted:
+                    return int(entry.get("context") or 0)
+        except Exception:
+            pass
     if not config.CACHED_CATALOG:
         return 0
     # Exact model ID match

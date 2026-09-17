@@ -68,9 +68,25 @@ def history_summary_params() -> str:
     upstream window is exhausted; `max_history_chars` bounds the abridged tail
     that is kept verbatim. Auggie parses this as JSON and expects snake_case.
     """
+    # The trigger is a share of the model's real window, so a 1M-token model is
+    # not compacted as if it only had 200k. An explicit env value still wins.
+    trigger = config.HISTORY_SUMMARY_TRIGGER_TOKENS
+    if not config.HISTORY_SUMMARY_TRIGGER_EXPLICIT:
+        window = effective_context_limit(config.TARGET_MODEL)
+        if window > 0:
+            trigger = max(16000, int(window * config.HISTORY_SUMMARY_TRIGGER_RATIO))
+    # The verbatim tail kept alongside the summary should also scale, otherwise
+    # a large-window model still loses most of its recent context.
+    keep_chars = config.HISTORY_SUMMARY_MAX_HISTORY_CHARS
+    if not config.HISTORY_SUMMARY_MAX_HISTORY_EXPLICIT:
+        window = effective_context_limit(config.TARGET_MODEL)
+        if window > 0:
+            # ~10% of the window at ~4 chars/token, capped so the summary does
+            # not become pointless (keeping nearly everything verbatim).
+            keep_chars = max(40000, min(400000, int(window * 4 * 0.10)))
     return json.dumps({
-        "trigger_on_total_tokens": config.HISTORY_SUMMARY_TRIGGER_TOKENS,
-        "max_history_chars": config.HISTORY_SUMMARY_MAX_HISTORY_CHARS,
+        "trigger_on_total_tokens": trigger,
+        "max_history_chars": keep_chars,
         "input_budget_trigger_ratio": config.HISTORY_SUMMARY_INPUT_BUDGET_RATIO,
     })
 

@@ -33,6 +33,14 @@ and the project uses [Semantic Versioning](https://semver.org/).
   (`AUGGIE_LAUNCH_HISTORY_SUMMARY*`).
 
 ### Fixed
+- Tool names are matched by shape (`*_search`, `*_glob`, `*_find`, ...) rather
+  than a fixed list. A closed list dropped `glob_search` and
+  `execute_terminal_command`, each of which surfaced to the user as
+  "Tool not found" with the turn unable to proceed.
+- The context window is read from the CodeGPT catalog. deepseek states 1M there;
+  without it the proxy injected a 200k limit and compacted history ~5x too early.
+- Summarization thresholds scale with that window (trigger 60%, kept tail 10%
+  capped at 400k chars) instead of being fixed at 120k/100k.
 - Reasoning is no longer streamed inside raw ` thinking...` text: the CLI renders
   reasoning itself, and the tags both leaked into the transcript and confused
   the model on later turns. `AUGGIE_LAUNCH_STREAM_THINKING` defaults to off.

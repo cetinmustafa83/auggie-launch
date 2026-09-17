@@ -1203,3 +1203,150 @@ class TestReasoningNotLeaked(unittest.TestCase):
         # A regression guard on the shipped default, not just the patched value.
         source = open(main.config.__file__, encoding="utf-8").read()
         self.assertIn('STREAM_THINKING = env_truthy("AUGGIE_LAUNCH_STREAM_THINKING", False)', source)
+
+
+
+class TestSearchPatternDetection(unittest.TestCase):
+    """Tool names are matched by shape, not by a fixed list. A closed list lost
+    `glob_search` (and would lose every new model's spelling), leaving the model
+    with "Tool not found" and no way to make progress."""
+
+    AVAILABLE = frozenset({"launch-process", "view", "save-file", "str-replace-editor", "remove-files"})
+
+    def _route(self, name, args=None):
+        return main.codegpt.route_tool_call(name, args or {"pattern": "x"}, self.AVAILABLE)
+
+    def test_known_search_names(self):
+        for name in ("search", "grep", "glob", "find", "file_search", "grep_search", "glob_search"):
+            resolved, _ = self._route(name)
+            self.assertEqual(resolved, "launch-process", name)
+
+    def test_unseen_search_spellings_are_recognised(self):
+        # Names no list ever enumerated, but obviously search-shaped.
+        for name in ("codebase_search", "search_symbols", "semantic_search", "repo_glob", "symbol_find"):
+            resolved, _ = self._route(name)
+            self.assertEqual(resolved, "launch-process", name)
+
+    def test_every_search_resolves_to_a_servable_tool(self):
+        for name in ("glob_search", "codebase_search", "file_search", "find_usages"):
+            resolved, _ = self._route(name)
+            self.assertIn(resolved, self.AVAILABLE, name)
+
+
+class TestTerminalCommandAliases(unittest.TestCase):
+    """The plain-shell name the model reaches for most often."""
+
+    AVAILABLE = frozenset({"launch-process", "view", "save-file"})
+
+    def test_shell_name_variants_map_to_launch_process(self):
+        for name in (
+            "execute_terminal_command", "run_terminal_command", "run_terminal_cmd",
+            "terminal_command", "execute_shell", "shell_command", "execute_bash",
+            "execute_command", "bash", "shell", "sh", "terminal", "run",
+        ):
+            self.assertEqual(
+                main.codegpt.resolve_tool_name(name, self.AVAILABLE),
+                "launch-process",
+                name,
+            )
+
+    def test_unmappable_name_is_left_untouched(self):
+        self.assertEqual(
+            main.codegpt.resolve_tool_name("totally_unknown_thing", self.AVAILABLE),
+            "totally_unknown_thing",
+        )
+
+
+
+class TestContextWindowFromCatalog(unittest.TestCase):
+    """deepseek-v4.1-flash has a 1M-token window, stated only in the CodeGPT
+    catalog. Without reading it the proxy told Auggie 200k, so history was
+    compacted and truncated far earlier than the model required."""
+
+    def test_codegpt_catalog_supplies_the_window(self):
+        entry = {"id": "deepseek-v4.1-flash", "provider": "openrouter", "context": 1048576, "tools": True}
+        with patch("auggie_launch.config.IS_CODEGPT", True), \
+             patch.object(main.codegpt, "load_catalog_models", return_value=[entry]):
+            self.assertEqual(main.models.lookup_catalog_context("deepseek-v4.1-flash"), 1048576)
+
+    def test_codegpt_lookup_ignores_unknown_models(self):
+        entry = {"id": "deepseek-v4.1-flash", "provider": "openrouter", "context": 1048576, "tools": True}
+        with patch("auggie_launch.config.IS_CODEGPT", True), \
+             patch.object(main.codegpt, "load_catalog_models", return_value=[entry]):
+            self.assertEqual(main.models.lookup_catalog_context("no-such-model"), 0)
+
+    def test_9router_catalog_still_used_when_not_codegpt(self):
+        with patch("auggie_launch.config.IS_CODEGPT", False), \
+             patch("auggie_launch.config.CACHED_CATALOG", {"free": {"contextWindow": 32000}}):
+            self.assertEqual(main.models.lookup_catalog_context("free"), 32000)
+
+
+class TestSummaryThresholdsScaleWithWindow(unittest.TestCase):
+    """The summarization trigger and the verbatim tail must follow the model's
+    real window; fixed values compacted a 1M model as if it had 200k."""
+
+    def _params(self, window, **overrides):
+        config_patches = {
+            "CODEGPT_SESSION_ID": "s",
+            "HISTORY_SUMMARY_TRIGGER_EXPLICIT": False,
+            "HISTORY_SUMMARY_MAX_HISTORY_EXPLICIT": False,
+            "HISTORY_SUMMARY_TRIGGER_RATIO": 0.6,
+            "HISTORY_SUMMARY_TRIGGER_TOKENS": 120000,
+            "HISTORY_SUMMARY_MAX_HISTORY_CHARS": 100000,
+        }
+        config_patches.update(overrides)
+        with patch("auggie_launch.config.IS_CODEGPT", True), \
+             patch.object(main.registry, "effective_context_limit", return_value=window):
+            with patch.multiple("auggie_launch.config", **config_patches):
+                return json.loads(main.registry.history_summary_params())
+
+    def test_large_window_raises_the_trigger(self):
+        params = self._params(1_048_576)
+        self.assertGreater(params["trigger_on_total_tokens"], 200000)
+        self.assertEqual(params["trigger_on_total_tokens"], int(1_048_576 * 0.6))
+
+    def test_keep_chars_is_capped_so_summaries_stay_useful(self):
+        params = self._params(1_048_576)
+        self.assertLessEqual(params["max_history_chars"], 400000)
+
+    def test_small_window_still_gets_a_floor(self):
+        params = self._params(8000)
+        self.assertGreaterEqual(params["trigger_on_total_tokens"], 16000)
+        self.assertGreaterEqual(params["max_history_chars"], 40000)
+
+    def test_explicit_env_value_wins(self):
+        params = self._params(1_048_576, HISTORY_SUMMARY_TRIGGER_EXPLICIT=True,
+                              HISTORY_SUMMARY_TRIGGER_TOKENS=50000)
+        self.assertEqual(params["trigger_on_total_tokens"], 50000)
+
+
+
+class TestGlobVersusContentSearch(unittest.TestCase):
+    """A filename glob and a content regex must not be served by the same
+    command. `grep -rn '**/*.py'` exits non-zero and prints nothing, which the
+    model reads as a dead end and then retries."""
+
+    AVAILABLE = frozenset({"launch-process", "view"})
+
+    def _command(self, pattern):
+        _name, args = main.codegpt.route_tool_call("glob_search", {"pattern": pattern}, self.AVAILABLE)
+        return args["command"]
+
+    def test_filename_globs_use_find(self):
+        for pattern in ("**/*.py", "*.txt", "src/**/*.ts", "*"):
+            command = self._command(pattern)
+            self.assertTrue(command.startswith("find"), (pattern, command))
+
+    def test_content_patterns_use_grep(self):
+        for pattern in ("TODO", "func_0_5", r"def \w+\(", "a/b"):
+            command = self._command(pattern)
+            self.assertTrue(command.startswith("grep"), (pattern, command))
+
+    def test_shell_payload_is_not_treated_as_a_glob(self):
+        command = self._command("a; rm -rf /")
+        self.assertTrue(command.startswith("grep"), command)
+        self.assertIn("'a; rm -rf /'", command)
+
+    def test_glob_command_is_quoted(self):
+        command = self._command("**/*.py")
+        self.assertIn("'*.py'", command)
