@@ -43,6 +43,7 @@ API_KEYS: list[str] = []
 FROZEN_KEYS: dict[str, float] = {}
 FROZEN_LOCK = threading.Lock()
 AUGGIE_BIN = "auggie"
+AUGGIE_PACKAGE = "@augmentcode/auggie"
 LOCAL_TOKEN = "fake-augment-access-token"
 _LOADED_ENV_FILES: list[str] = []
 # Stable per-process identifiers for the Codex-style upstream headers.
@@ -51,6 +52,8 @@ _CODEX_THREAD_ID = str(uuid.uuid4())
 _CODEX_INSTALLATION_ID = str(uuid.uuid4())
 VERBOSE = False
 DEBUG_DIR = ""
+# Debug dumps older than this are pruned on the next write.
+DEBUG_RETENTION_SECONDS = 3600.0
 PORT = 0
 
 UPSTREAM_USER_AGENT = "codex-cli"
@@ -302,8 +305,8 @@ def with_codex_headers(headers: dict[str, str]) -> dict[str, str]:
 
 
 def load_config() -> None:
-    global TARGET_BASE_URL, TARGET_MODEL, TARGET_API_KEY, API_KEYS, AUGGIE_BIN
-    global LOCAL_TOKEN, VERBOSE, DEBUG_DIR, PORT, _LOADED_ENV_FILES
+    global TARGET_BASE_URL, TARGET_MODEL, TARGET_API_KEY, API_KEYS, AUGGIE_BIN, AUGGIE_PACKAGE
+    global LOCAL_TOKEN, VERBOSE, DEBUG_DIR, PORT, _LOADED_ENV_FILES, DEBUG_RETENTION_SECONDS
     global UPSTREAM_USER_AGENT, UPSTREAM_APP_NAME, SANITIZE_UPSTREAM_PROMPTS
     global REPLY_LANGUAGE, STREAM_THINKING, DYNAMIC_MODELS, USE_COMPLETION_TOKENS
     global ENABLE_CONNECTION_POOL, AUTO_INJECT_MCP, CACHED_CATALOG
@@ -350,11 +353,13 @@ def load_config() -> None:
     TARGET_MODEL = os.environ["AUGGIE_LAUNCH_MODEL"].strip()
     TARGET_API_KEY = API_KEYS[0]
     AUGGIE_BIN = (os.environ.get("AUGGIE_BIN") or "auggie").strip()
+    AUGGIE_PACKAGE = (os.environ.get("AUGGIE_LAUNCH_AUGGIE_PACKAGE") or "@augmentcode/auggie").strip()
     # Per-session random token unless pinned: the proxy is loopback-only but still
     # refuses requests that do not carry the token it injected into Auggie.
     LOCAL_TOKEN = (os.environ.get("AUGGIE_LAUNCH_LOCAL_TOKEN") or f"al-{uuid.uuid4().hex}").strip()
     VERBOSE = env_truthy("AUGGIE_LAUNCH_VERBOSE")
     DEBUG_DIR = (os.environ.get("AUGGIE_LAUNCH_DEBUG_DIR") or os.path.join(tempfile.gettempdir(), "auggie-launch")).strip()
+    DEBUG_RETENTION_SECONDS = bounded_float(os.environ.get("AUGGIE_LAUNCH_DEBUG_RETENTION_SECONDS"), 3600.0)
     PORT = env_int("AUGGIE_LAUNCH_PORT", 0)
 
     UPSTREAM_USER_AGENT = (os.environ.get("AUGGIE_LAUNCH_USER_AGENT") or default_upstream_user_agent("codex-cli")).strip()

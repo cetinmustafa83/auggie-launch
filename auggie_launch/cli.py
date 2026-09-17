@@ -10,7 +10,7 @@ from http.server import ThreadingHTTPServer
 
 from . import config
 from .config import load_config, log
-from .doctor import run_doctor
+from .doctor import run_doctor, update_auggie
 from .injections import build_injected_environment, generate_injected_mcp_config
 from .proxy import AuggieProxy
 from .server import (
@@ -111,6 +111,8 @@ def main() -> None:
             "--proxy-only",
             "--check",
             "--doctor",
+            "--no-update-check",
+            "--update-auggie",
             "--models",
             "--sessions",
             "--mode",
@@ -126,6 +128,8 @@ def main() -> None:
         print("       auggie-launch [auggie args]")
         print("\nLauncher options:")
         print("  --check, --doctor           End-to-end diagnostics (token, catalog, MCP, tools)")
+        print("  --no-update-check           Skip the CLI version comparison during --doctor")
+        print("  --update-auggie             Install the latest @augmentcode/auggie globally")
         print("  --models                    List the models served to the CLI")
         print("  --print-env                 Show resolved config")
         print("  -c, --continue              Resume the most recent session")
@@ -140,8 +144,11 @@ def main() -> None:
     load_config()
     port = config.PORT or find_free_port()
 
+    if "--update-auggie" in launcher_args:
+        sys.exit(update_auggie())
+
     if "--check" in launcher_args or "--doctor" in launcher_args:
-        sys.exit(run_doctor())
+        sys.exit(run_doctor(check_updates="--no-update-check" not in launcher_args))
 
     if "--mode" in launcher_args:
         mode = launcher_args[launcher_args.index("--mode") + 1]

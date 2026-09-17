@@ -24,13 +24,42 @@ from .upstream import compact_upstream_error, json_bytes, open_upstream_with_ret
 # ============================================================================
 
 def dump_debug_request(body: Any, openai_request: dict[str, Any]) -> None:
-    """Write incoming/outgoing payloads to the debug dir when verbose mode is on."""
+    """Write incoming/outgoing payloads to the debug dir when verbose mode is on.
+
+    A high-volume debug dir is not free: without a bound it grows one pair of
+    files per request and is never cleaned up. Only the most recent dumps are
+    kept, and the old ones are pruned here rather than left to the user.
+    """
     if not config.VERBOSE:
         return
     os.makedirs(config.DEBUG_DIR, exist_ok=True)
     for name, value in (("incoming_augment_request.json", body), ("outgoing_openai_request.json", openai_request)):
         with open(os.path.join(config.DEBUG_DIR, name), "w", encoding="utf-8") as f:
             json.dump(value, f, ensure_ascii=False, indent=2)
+    prune_debug_dir()
+
+
+def prune_debug_dir(keep_seconds: float | None = None) -> int:
+    """Deletes debug dumps older than the retention window. Returns the count."""
+    window = config.DEBUG_RETENTION_SECONDS if keep_seconds is None else keep_seconds
+    directory = config.DEBUG_DIR
+    if not directory or not os.path.isdir(directory):
+        return 0
+    cutoff = time.time() - max(0.0, window)
+    removed = 0
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return 0
+    for entry in entries:
+        path = os.path.join(directory, entry)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def read_json(handler: BaseHTTPRequestHandler) -> Any:

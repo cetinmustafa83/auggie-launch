@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import socket
+import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,13 +43,70 @@ def check_python() -> str:
     return PASS if ok else FAIL
 
 
-def check_auggie_binary() -> str:
+def installed_auggie_version() -> str:
+    """The CLI's own version string, or "" when it cannot be read."""
+    binary = shutil.which(config.AUGGIE_BIN)
+    if not binary:
+        return ""
+    try:
+        proc = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=20)
+    except Exception:
+        return ""
+    text = (proc.stdout or proc.stderr).strip()
+    return text.split()[0] if text else ""
+
+
+def latest_auggie_version() -> str:
+    """The newest published version, or "" when offline or npm is missing."""
+    if not shutil.which("npm"):
+        return ""
+    try:
+        proc = subprocess.run(
+            ["npm", "view", config.AUGGIE_PACKAGE, "version"],
+            capture_output=True, text=True, timeout=45,
+        )
+    except Exception:
+        return ""
+    return (proc.stdout or "").strip().splitlines()[-1].strip() if proc.stdout else ""
+
+
+def check_auggie_binary(check_updates: bool = True) -> str:
     path = shutil.which(config.AUGGIE_BIN)
     if not path:
         _report(FAIL, "auggie binary", f"'{config.AUGGIE_BIN}' not on PATH")
         return FAIL
-    _report(PASS, "auggie binary", path)
-    return PASS
+    installed = installed_auggie_version()
+    _report(PASS, "auggie binary", f"{path}" + (f" (v{installed})" if installed else ""))
+
+    if not check_updates or not installed:
+        return PASS
+    latest = latest_auggie_version()
+    if not latest:
+        _report(WARN, "auggie version", f"v{installed}; could not reach npm to compare")
+        return WARN
+    if latest == installed:
+        _report(PASS, "auggie version", f"v{installed} (latest)")
+        return PASS
+    _report(WARN, "auggie version", f"v{installed} installed, v{latest} available — run: auggie-launch --update-auggie")
+    return WARN
+
+
+def update_auggie() -> int:
+    """Installs the latest CLI globally. Returns a process exit code."""
+    if not shutil.which("npm"):
+        print("error: npm is required to update the CLI", file=sys.stderr)
+        return 1
+    print(f"installing {config.AUGGIE_PACKAGE}@latest ...")
+    command = ["npm", "install", "-g", f"{config.AUGGIE_PACKAGE}@latest"]
+    if os.geteuid() != 0:
+        # Same rule as install.sh: a non-root user installs into ~/.local.
+        command.extend(["--prefix", os.path.join(os.path.expanduser("~"), ".local")])
+    result = subprocess.run(command)
+    if result.returncode != 0:
+        print("error: update failed", file=sys.stderr)
+        return result.returncode
+    print(f"updated to v{installed_auggie_version() or 'unknown'}")
+    return 0
 
 
 def check_codegpt_token() -> tuple[str, str]:
@@ -256,7 +315,7 @@ def check_local_state() -> str:
     return PASS
 
 
-def run_doctor() -> int:
+def run_doctor(check_updates: bool = True) -> int:
     """Runs every check. Returns a process exit code."""
     print("=" * 62)
     print("auggie-launch doctor")
@@ -268,7 +327,7 @@ def run_doctor() -> int:
 
     results: list[str] = []
     results.append(check_python())
-    results.append(check_auggie_binary())
+    results.append(check_auggie_binary(check_updates=check_updates))
     token_status, token = check_codegpt_token()
     results.append(token_status)
     results.append(check_catalog())

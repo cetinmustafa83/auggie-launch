@@ -1504,3 +1504,157 @@ class TestFlagDeliveryEndToEnd(unittest.TestCase):
         self.assertEqual(flags.get("agent_max_iterations"), 10000)
         self.assertIs(flags.get("cliEnablePlanMode"), True)
         self.assertIs(flags.get("cliEnablePersona"), True)
+
+
+class TestDoctorChecks(unittest.TestCase):
+    """The doctor module had no coverage at all, despite being the first thing
+    a stuck user runs."""
+
+    def test_report_formatting_uses_a_marker_per_status(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main.doctor._report(main.doctor.PASS, "thing", "detail")
+        self.assertIn("[OK]", buf.getvalue())
+        self.assertIn("thing", buf.getvalue())
+        self.assertIn("detail", buf.getvalue())
+
+    def test_fail_marker_is_distinct(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main.doctor._report(main.doctor.FAIL, "broken")
+        self.assertIn("[FAIL]", buf.getvalue())
+
+    def test_missing_binary_fails(self):
+        with patch("shutil.which", return_value=None):
+            self.assertEqual(main.doctor.check_auggie_binary(), main.doctor.FAIL)
+
+    def test_outdated_cli_is_a_warning_not_a_failure(self):
+        with patch("shutil.which", return_value="/usr/bin/auggie"), \
+             patch.object(main.doctor, "installed_auggie_version", return_value="0.36.0"), \
+             patch.object(main.doctor, "latest_auggie_version", return_value="0.99.0"):
+            result = main.doctor.check_auggie_binary(check_updates=True)
+        self.assertEqual(result, main.doctor.WARN)
+
+    def test_up_to_date_cli_passes(self):
+        with patch("shutil.which", return_value="/usr/bin/auggie"), \
+             patch.object(main.doctor, "installed_auggie_version", return_value="1.2.3"), \
+             patch.object(main.doctor, "latest_auggie_version", return_value="1.2.3"):
+            self.assertEqual(main.doctor.check_auggie_binary(), main.doctor.PASS)
+
+    def test_offline_version_check_degrades_to_a_warning(self):
+        with patch("shutil.which", return_value="/usr/bin/auggie"), \
+             patch.object(main.doctor, "installed_auggie_version", return_value="1.2.3"), \
+             patch.object(main.doctor, "latest_auggie_version", return_value=""):
+            self.assertEqual(main.doctor.check_auggie_binary(), main.doctor.WARN)
+
+    def test_update_check_can_be_skipped(self):
+        with patch("shutil.which", return_value="/usr/bin/auggie"), \
+             patch.object(main.doctor, "latest_auggie_version", return_value="9.9.9") as latest:
+            self.assertEqual(main.doctor.check_auggie_binary(check_updates=False), main.doctor.PASS)
+        latest.assert_not_called()
+
+    def test_missing_npm_is_reported_before_any_install(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with patch("shutil.which", return_value=None), contextlib.redirect_stderr(buf):
+            code = main.doctor.update_auggie()
+        self.assertEqual(code, 1)
+        self.assertIn("npm is required", buf.getvalue())
+
+    def test_update_installs_latest_globally(self):
+        import subprocess as _subprocess
+        completed = _subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch("shutil.which", return_value="/usr/bin/npm"), \
+             patch.object(main.doctor.subprocess, "run", return_value=completed) as run, \
+             patch.object(main.doctor, "installed_auggie_version", return_value="2.0.0"):
+            code = main.doctor.update_auggie()
+        self.assertEqual(code, 0)
+        command = run.call_args[0][0]
+        self.assertIn(f"{main.config.AUGGIE_PACKAGE}@latest", command)
+        self.assertIn("-g", command)
+
+    def test_roundtrip_check_reports_a_bad_token(self):
+        import urllib.error
+        with patch("auggie_launch.config.IS_CODEGPT", True), \
+             patch.object(main.codegpt, "extra_headers", return_value={}), \
+             patch.object(main.codegpt, "adapt_request_body", return_value={}), \
+             patch.object(main.doctor, "upstream_url_for_doctor",
+                          return_value="https://example.invalid/v1/chat/tools/codegpt"), \
+             patch.object(main.doctor.urllib.request, "urlopen",
+                          side_effect=urllib.error.HTTPError("u", 401, "unauthorized", {}, None)):
+            self.assertEqual(main.doctor.check_codegpt_roundtrip("tok"), main.doctor.FAIL)
+
+    def test_roundtrip_check_is_skipped_without_codegpt(self):
+        with patch("auggie_launch.config.IS_CODEGPT", False):
+            self.assertEqual(main.doctor.check_codegpt_roundtrip(""), main.doctor.PASS)
+
+    def test_prompt_history_permissions_are_flagged(self):
+        import tempfile
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "prompt-history.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+        os.chmod(path, 0o644)
+        with patch("os.path.join", side_effect=lambda *p: path if p and p[-1] == "prompt-history.jsonl" else os.path.join(*p)):
+            result = main.doctor.check_local_state()
+        self.assertEqual(result, main.doctor.WARN)
+
+    def test_doctor_returns_nonzero_when_a_check_fails(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with patch.object(main.doctor, "check_python", return_value=main.doctor.FAIL), \
+             contextlib.redirect_stdout(buf):
+            code = main.doctor.run_doctor(check_updates=False)
+        self.assertEqual(code, 1)
+        self.assertIn("failure(s)", buf.getvalue())
+
+    def test_doctor_returns_zero_when_clean(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with patch.object(main.doctor, "check_python", return_value=main.doctor.PASS), \
+             patch.object(main.doctor, "check_auggie_binary", return_value=main.doctor.PASS), \
+             patch.object(main.doctor, "check_codegpt_token", return_value=(main.doctor.PASS, "")), \
+             patch.object(main.doctor, "check_catalog", return_value=main.doctor.PASS), \
+             patch.object(main.doctor, "check_model_resolution", return_value=main.doctor.PASS), \
+             patch.object(main.doctor, "check_upstream_connection", return_value=main.doctor.PASS), \
+             patch.object(main.doctor, "check_codegpt_roundtrip", return_value=main.doctor.PASS), \
+             patch.object(main.doctor, "check_mcp", return_value=main.doctor.PASS), \
+             patch.object(main.doctor, "check_tool_mapping", return_value=main.doctor.PASS), \
+             patch.object(main.doctor, "check_repo_hygiene", return_value=main.doctor.PASS), \
+             patch.object(main.doctor, "check_local_state", return_value=main.doctor.PASS), \
+             contextlib.redirect_stdout(buf):
+            code = main.doctor.run_doctor(check_updates=False)
+        self.assertEqual(code, 0)
+        self.assertIn("all checks passed", buf.getvalue())
+
+
+class TestDebugPruning(unittest.TestCase):
+    """The debug dir grew a pair of files per request and was never cleaned."""
+
+    def test_old_dumps_are_removed(self):
+        import tempfile
+        import time as _time
+        directory = tempfile.mkdtemp()
+        old = os.path.join(directory, "incoming_augment_request.json")
+        new = os.path.join(directory, "outgoing_openai_request.json")
+        for path in (old, new):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+        past = _time.time() - 7200
+        os.utime(old, (past, past))
+        with patch("auggie_launch.config.DEBUG_DIR", directory):
+            removed = main.proxy.prune_debug_dir(keep_seconds=3600)
+        self.assertEqual(removed, 1)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))
+
+    def test_missing_directory_is_harmless(self):
+        with patch("auggie_launch.config.DEBUG_DIR", "/nonexistent/debug/dir"):
+            self.assertEqual(main.proxy.prune_debug_dir(), 0)

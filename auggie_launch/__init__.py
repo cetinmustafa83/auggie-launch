@@ -5,6 +5,7 @@ from . import (  # noqa: F401
     cli,
     codegpt,
     config,
+    doctor,
     injections,
     models,
     proxy,

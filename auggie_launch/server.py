@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import shlex
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -63,6 +65,9 @@ def mode_runs_until_done(mode: str) -> bool:
 
 _SECRET_MARKERS = ("TOKEN", "API_KEY", "SECRET", "PASSWORD", "SIGNED_DISTINCT")
 
+# Ceiling for one post-run check; enoug h for a slow suite, short enough to notice.
+CHECK_TIMEOUT_SECONDS = int(os.environ.get("AUGGIE_LAUNCH_CHECK_TIMEOUT") or "300")
+
 
 def _is_secret_key(name: str) -> bool:
     """True for environment names whose value must not reach a child process."""
@@ -76,8 +81,6 @@ def post_run_checks() -> list[dict[str, Any]]:
     Mirrors `make check`: a task is only done when these are green, so the
     launcher reports them instead of leaving the verdict to the model.
     """
-    import shlex
-    import subprocess
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     checks = [
@@ -94,13 +97,23 @@ def post_run_checks() -> list[dict[str, Any]]:
     for name, command in checks:
         try:
             proc = subprocess.run(command, capture_output=True, text=True, cwd=root,
-                                  timeout=300, env=child_env)
+                                  timeout=CHECK_TIMEOUT_SECONDS, env=child_env)
             output = (proc.stdout + proc.stderr).strip()
             results.append({
                 "name": name,
                 "ok": proc.returncode == 0,
                 "command": " ".join(shlex.quote(part) for part in command),
                 "output": output[-4000:],
+            })
+        except subprocess.TimeoutExpired:
+            # Distinguish a timeout from a real failure: "check failed" would send
+            # someone looking for a broken assertion that does not exist.
+            results.append({
+                "name": name,
+                "ok": False,
+                "command": " ".join(shlex.quote(part) for part in command),
+                "output": f"timed out after {CHECK_TIMEOUT_SECONDS}s -- raise "
+                          f"AUGGIE_LAUNCH_CHECK_TIMEOUT if the suite is legitimately slow",
             })
         except Exception as exc:
             results.append({
