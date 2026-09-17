@@ -109,7 +109,8 @@ def resolve_tool_calls(openai_request: dict[str, Any], tool_calls: list[dict[str
     available: set[str] = set()
     for tool in openai_request.get("tools") or []:
         if isinstance(tool, dict):
-            fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            fn_raw = tool.get("function")
+            fn: dict[str, Any] = fn_raw if isinstance(fn_raw, dict) else tool
             name = fn.get("name")
             if isinstance(name, str):
                 available.add(name)
@@ -123,17 +124,17 @@ def resolve_tool_calls(openai_request: dict[str, Any], tool_calls: list[dict[str
     # then concatenate that with the real arguments, producing invalid JSON.
     resolved: list[dict[str, Any]] = []
     for call in merge_stream_tool_calls(tool_calls):
-        fn = call.get("function")
-        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
-            args = codegpt._coerce_arguments(fn.get("arguments"))
-            name, shaped = codegpt.route_tool_call(fn["name"], args, available)
-            if name != fn["name"]:
-                log(f"tool remap: {fn['name']} -> {name}")
-            fn = dict(fn)
-            fn["name"] = name
+        fn_src = call.get("function")
+        fn_call: dict[str, Any] = dict(fn_src) if isinstance(fn_src, dict) else {}
+        if isinstance(fn_call.get("name"), str):
+            args = codegpt._coerce_arguments(fn_call.get("arguments"))
+            name, shaped = codegpt.route_tool_call(fn_call["name"], args, available)
+            if name != fn_call["name"]:
+                log(f"tool remap: {fn_call['name']} -> {name}")
+            fn_call["name"] = name
             if shaped != args:
-                fn["arguments"] = json.dumps(shaped, ensure_ascii=False)
-            call = {**call, "function": fn}
+                fn_call["arguments"] = json.dumps(shaped, ensure_ascii=False)
+            call = {**call, "function": fn_call}
         resolved.append(call)
     return resolved
 

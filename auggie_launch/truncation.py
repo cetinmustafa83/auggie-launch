@@ -195,7 +195,8 @@ def merge_stream_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, 
         if idx is None:
             idx = len(merged)
         call_id = call.get("id")
-        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        fn_raw = call.get("function")
+        fn: dict[str, Any] = fn_raw if isinstance(fn_raw, dict) else {}
 
         target = by_index.get(idx)
         # A new id on a seen index means a fresh parallel call, not a continuation.
@@ -211,17 +212,19 @@ def merge_stream_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, 
             by_index[idx] = target
         elif call_id:
             target["id"] = call_id
-        if fn.get("name"):
-            target["function"]["name"] += fn["name"]
-        if fn.get("arguments"):
-            target["function"]["arguments"] += fn["arguments"]
+        fn_target = target["function"]
+        if isinstance(fn.get("name"), str):
+            fn_target["name"] = str(fn_target.get("name") or "") + fn["name"]
+        if isinstance(fn.get("arguments"), str):
+            fn_target["arguments"] = str(fn_target.get("arguments") or "") + fn["arguments"]
 
     result: list[dict[str, Any]] = []
     for item in merged:
-        name = item["function"]["name"].strip()
+        fn_item = item["function"]
+        name = str(fn_item.get("name") or "").strip()
         if not name:
             continue
-        item["function"]["arguments"] = repair_json_arguments(item["function"]["arguments"])
+        fn_item["arguments"] = repair_json_arguments(str(fn_item.get("arguments") or ""))
         result.append(item)
     return result
 

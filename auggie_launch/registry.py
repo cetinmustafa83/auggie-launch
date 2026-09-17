@@ -178,9 +178,10 @@ def fake_models() -> dict[str, Any]:
     if config.DYNAMIC_MODELS and not config.IS_CODEGPT:
         dynamic_list = fetch_upstream_models()
         for item in dynamic_list:
-            mid = item.get("id")
-            if not mid or mid in seen_models:
+            mid_raw = item.get("id")
+            if not isinstance(mid_raw, str) or not mid_raw or mid_raw in seen_models:
                 continue
+            mid = mid_raw
             seen_models.add(mid)
             mid_context = effective_context_limit(mid)
             models_list.append(model_list_entry(mid, mid_context))

@@ -1419,3 +1419,33 @@ class TestSessionsShortcuts(unittest.TestCase):
              contextlib.redirect_stdout(out):
             main.cli.print_sessions()
         self.assertIn("no saved sessions", out.getvalue())
+
+
+class TestLaunchProcessArguments(unittest.TestCase):
+    """`launch-process` needs every required field, and omitting keep_stdin_open
+    makes a successful command return empty output -- the model then sees a dead
+    end and retries the same command indefinitely."""
+
+    AVAILABLE = frozenset({"launch-process", "view"})
+
+    def _args(self, pattern):
+        _name, args = main.codegpt.route_tool_call("grep_search", {"pattern": pattern}, self.AVAILABLE)
+        return args
+
+    def test_all_required_fields_are_present(self):
+        args = self._args("TODO")
+        for field in ("command", "cwd", "wait", "max_wait_seconds"):
+            self.assertIn(field, args, field)
+
+    def test_keep_stdin_open_is_explicit(self):
+        # Absence of this flag is what swallowed the command output.
+        self.assertIs(self._args("TODO")["keep_stdin_open"], False)
+
+    def test_command_is_waitable(self):
+        args = self._args("TODO")
+        self.assertIs(args["wait"], True)
+        self.assertGreater(args["max_wait_seconds"], 0)
+
+    def test_glob_command_also_carries_the_flag(self):
+        args = self._args("**/*.py")
+        self.assertIs(args["keep_stdin_open"], False)

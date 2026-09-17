@@ -240,7 +240,8 @@ def _flatten_tool_calls(tool_calls: Any) -> str:
         for call in tool_calls:
             if not isinstance(call, dict):
                 continue
-            fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+            fn_raw = call.get("function")
+            fn: dict[str, Any] = fn_raw if isinstance(fn_raw, dict) else {}
             name = fn.get("name") or call.get("name") or "tool"
             args = fn.get("arguments") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments") or {})
             lines.append(f"[Earlier tool call: {name} with arguments {args}]")
@@ -527,7 +528,15 @@ def route_tool_call(name: str, args: dict[str, Any], available: set[str]) -> tup
                 command = f"grep -rn -- {shell_quote(pattern)} {shell_quote(scope)}"
             else:
                 command = f"ls -la {shell_quote(scope)}"
-            return "launch-process", {"command": command, "cwd": ".", "wait": True, "max_wait_seconds": 60}
+            return "launch-process", {
+                "command": command,
+                "cwd": ".",
+                "wait": True,
+                "max_wait_seconds": 60,
+                # Without this the command's output can come back empty even on
+                # success, leaving the model with nothing to act on.
+                "keep_stdin_open": False,
+            }
 
         if "view" in available:
             shaped = {"path": ".", "type": "directory"}
@@ -582,13 +591,17 @@ def adapt_request_body(request: dict[str, Any]) -> dict[str, Any]:
     `modelId` (not `model`) and a `session_id` accompanies `requestId`; no agent
     is involved.
     """
-    raw_tools = request.get("tools") if isinstance(request.get("tools"), list) else []
-    available = {
-        (t.get("function") or {}).get("name") or t.get("name")
-        for t in raw_tools
-        if isinstance(t, dict)
-    }
-    available = {n for n in available if isinstance(n, str)}
+    tools = request.get("tools")
+    tools = tools if isinstance(tools, list) else []
+    available: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn_raw = tool.get("function")
+        fn_entry = fn_raw if isinstance(fn_raw, dict) else tool
+        name = fn_entry.get("name")
+        if isinstance(name, str) and name:
+            available.add(name)
     messages = [dict(m) for m in (request.get("messages") or []) if isinstance(m, dict)]
     for msg in messages:
         _normalize_tool_calls(msg, available)
@@ -611,14 +624,15 @@ def adapt_request_body(request: dict[str, Any]) -> dict[str, Any]:
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
-            fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-            name = fn.get("name")
+            fn_src = tool.get("function")
+            fn_tool: dict[str, Any] = fn_src if isinstance(fn_src, dict) else tool
+            name = fn_tool.get("name")
             if not isinstance(name, str) or not name:
                 continue
             flat_tools.append({
                 "name": name,
-                "description": str(fn.get("description") or ""),
-                "parameters": gemini_safe_schema(fn.get("parameters") or {"type": "object", "properties": {}}),
+                "description": str(fn_tool.get("description") or ""),
+                "parameters": gemini_safe_schema(fn_tool.get("parameters") or {"type": "object", "properties": {}}),
             })
         if flat_tools:
             body["tools"] = flat_tools

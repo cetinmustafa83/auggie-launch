@@ -74,20 +74,20 @@ def lookup_catalog_context(model_id: str) -> int:
         return 0
     # Exact model ID match
     if model_id in config.CACHED_CATALOG:
-        entry = config.CACHED_CATALOG.get(model_id)
-        if isinstance(entry, dict):
-            ctx = entry.get("contextWindow") or entry.get("context_window") or entry.get("contextLength")
+        entry1: Any = config.CACHED_CATALOG.get(model_id)
+        if isinstance(entry1, dict):
+            ctx = entry1.get("contextWindow") or entry1.get("context_window") or entry1.get("contextLength")
             if isinstance(ctx, (int, float)) and ctx > 0:
                 return int(ctx)
     # Last segment match (e.g., "gpt-4o" from "openai/gpt-4o")
     if "/" in model_id:
         last_segment = model_id.split("/")[-1]
         if last_segment in config.CACHED_CATALOG:
-            entry = config.CACHED_CATALOG.get(last_segment)
-            if isinstance(entry, dict):
-                ctx = entry.get("contextWindow") or entry.get("context_window") or entry.get("contextLength")
-                if isinstance(ctx, (int, float)) and ctx > 0:
-                    return int(ctx)
+            entry2: Any = config.CACHED_CATALOG.get(last_segment)
+            if isinstance(entry2, dict):
+                ctx2 = entry2.get("contextWindow") or entry2.get("context_window") or entry2.get("contextLength")
+                if isinstance(ctx2, (int, float)) and ctx2 > 0:
+                    return int(ctx2)
     return 0
 
 def combo_context_limit(combo: dict[str, Any]) -> int:
