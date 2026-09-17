@@ -114,13 +114,16 @@ run_npm_global() {
     return 1
   fi
   echo "installing CLI via npm: $pkg"
+  # Non-root installs to ~/.local so no sudo is needed; root uses the system
+  # prefix. One path, one attempt -- the previous mirrored fallbacks meant a
+  # non-root user and a root user got opposite precedence.
+  local prefix_flag=()
   if [[ "$(id -u)" -ne 0 ]]; then
-    npm install -g "$pkg" --prefix "${HOME}/.local" || npm install -g "$pkg"
-  else
-    npm install -g "$pkg" || {
-      echo "retry npm install with --prefix ${HOME}/.local"
-      npm install -g "$pkg" --prefix "${HOME}/.local"
-    }
+    prefix_flag=(--prefix "${HOME}/.local")
+  fi
+  if ! npm install -g "${prefix_flag[@]}" "$pkg"; then
+    echo "error: 'npm install -g $pkg' failed" >&2
+    return 1
   fi
   local npm_bin
   npm_bin="$(npm prefix -g 2>/dev/null)/bin"

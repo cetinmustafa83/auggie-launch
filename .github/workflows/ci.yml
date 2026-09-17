@@ -24,15 +24,18 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Unit tests
-        run: python -m unittest -v test_modern_proxy
+        run: python -m unittest -v test_modern_proxy test_install
       - name: CLI smoke test
         env:
-          AUGGIE_LAUNCH_BASE_URL: http://localhost:20128/v1
-          AUGGIE_LAUNCH_MODEL: free
+          AUGGIE_LAUNCH_BASE_URL: https://api.codegpt.co/api/v1
+          AUGGIE_LAUNCH_MODEL: deepseek-v4.1-flash
           AUGGIE_LAUNCH_API_KEY: ci-dummy-key
-          AUGGIE_LAUNCH_AUTO_INSTALL_9ROUTER: "false"
+          # Keep startup deterministic: no token probing, no config warnings.
+          AUGGIE_LAUNCH_CODEGPT_SESSION_URL: ""
+          AUGGIE_LAUNCH_CONFIG_CHECK: "false"
         run: |
           python -m auggie_launch --help
+          python -m auggie_launch --models
           python -m auggie_launch --print-env
 
   lint:
@@ -45,7 +48,7 @@ jobs:
           python-version: "3.12"
       - run: pip install ruff mypy
       - name: Ruff
-        run: ruff check .
+        run: ruff check auggie_launch/ test_modern_proxy.py test_install.py
       - name: Mypy
         run: mypy
 

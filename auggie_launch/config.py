@@ -407,6 +407,63 @@ def load_config() -> None:
     ENABLE_CONNECTION_POOL = env_truthy("AUGGIE_LAUNCH_CONNECTION_POOL", True)
     AUTO_INJECT_MCP = env_truthy("AUGGIE_LAUNCH_AUTO_INJECT_MCP", True)
 
+    if env_truthy("AUGGIE_LAUNCH_CONFIG_CHECK", True):
+        report_config_warnings(validate_config())
+
+
+def validate_config() -> list[str]:
+    """Reports configuration that will not do what the user expects.
+
+    Returns warnings rather than raising: a mistyped provider should not stop the
+    launcher, but it must not be discovered halfway through a long turn either.
+    """
+    warnings: list[str] = []
+
+    if IS_CODEGPT:
+        if CODEGPT_PROVIDER:
+            try:
+                from . import codegpt
+                # Read the catalog directly: provider_for_model() would just hand
+                # back the pinned value and the comparison would always match.
+                derived = ""
+                wanted = (TARGET_MODEL or "").strip().lower()
+                for entry in codegpt.load_catalog_models():
+                    if entry["id"].lower() == wanted:
+                        derived = str(entry.get("provider") or "")
+                        break
+                if derived and derived != CODEGPT_PROVIDER:
+                    warnings.append(
+                        f"AUGGIE_LAUNCH_CODEGPT_PROVIDER={CODEGPT_PROVIDER} is pinned, but "
+                        f"{TARGET_MODEL} is served by {derived}; requests will likely fail"
+                    )
+            except Exception:
+                pass
+        if not CODEGPT_TOKEN and not CODEGPT_SESSION_URL:
+            warnings.append(
+                "no CodeGPT token and no session URL: set AUGGIE_LAUNCH_CODEGPT_TOKEN "
+                "or let the VS Code extension serve one"
+            )
+    else:
+        if not API_KEYS:
+            warnings.append("AUGGIE_LAUNCH_API_KEY is empty")
+
+    if TARGET_BASE_URL.startswith("http://") and "localhost" not in TARGET_BASE_URL and "127.0.0.1" not in TARGET_BASE_URL:
+        warnings.append(f"AUGGIE_LAUNCH_BASE_URL={TARGET_BASE_URL} is plain http to a remote host")
+
+    if MODEL_CONTEXT_TOKENS_EXPLICIT and MODEL_MAX_OUTPUT_TOKENS >= MODEL_CONTEXT_TOKENS:
+        warnings.append(
+            f"AUGGIE_LAUNCH_MODEL_MAX_OUTPUT_TOKENS ({MODEL_MAX_OUTPUT_TOKENS}) leaves no room "
+            f"inside the {MODEL_CONTEXT_TOKENS}-token context"
+        )
+
+    return warnings
+
+
+def report_config_warnings(warnings: list[str]) -> None:
+    """Prints warnings to stderr, once, in a form that is easy to grep."""
+    for warning in warnings:
+        print(f"[auggie-launch] config warning: {warning}", file=sys.stderr)
+
 
 def log(message: str) -> None:
     if VERBOSE:

@@ -1197,3 +1197,64 @@ class TestTerminalCommandAliases(unittest.TestCase):
             main.codegpt.resolve_tool_name("totally_unknown_thing", self.AVAILABLE),
             "totally_unknown_thing",
         )
+
+
+class TestConfigValidation(unittest.TestCase):
+    """A mistyped provider or a missing token should surface at startup, not
+    halfway through a long turn."""
+
+    def _warnings(self, **overrides):
+        base = {
+            "TARGET_BASE_URL": "https://api.codegpt.co/api/v1",
+            "TARGET_MODEL": "deepseek-v4.1-flash",
+            "CODEGPT_PROVIDER": "",
+            "CODEGPT_TOKEN": "tok",
+            "CODEGPT_SESSION_URL": "",
+            "API_KEYS": ["k"],
+            "MODEL_CONTEXT_TOKENS": 200000,
+            "MODEL_MAX_OUTPUT_TOKENS": 16000,
+            "MODEL_CONTEXT_TOKENS_EXPLICIT": False,
+        }
+        base.update(overrides)
+        with patch("auggie_launch.config.IS_CODEGPT", True), \
+             patch.object(main.codegpt, "load_catalog_models",
+                          return_value=[{"id": "deepseek-v4.1-flash", "provider": "openrouter"}]):
+            with patch.multiple("auggie_launch.config", **base):
+                return main.config.validate_config()
+
+    def test_wrong_pinned_provider_is_reported(self):
+        warnings = self._warnings(CODEGPT_PROVIDER="gemini")
+        self.assertTrue(any("gemini" in w and "openrouter" in w for w in warnings), warnings)
+
+    def test_matching_provider_is_silent(self):
+        self.assertEqual(self._warnings(CODEGPT_PROVIDER="openrouter"), [])
+
+    def test_unpinned_provider_is_silent(self):
+        self.assertEqual(self._warnings(CODEGPT_PROVIDER=""), [])
+
+    def test_missing_token_and_session_url_is_reported(self):
+        warnings = self._warnings(CODEGPT_TOKEN="", CODEGPT_SESSION_URL="")
+        self.assertTrue(any("token" in w for w in warnings), warnings)
+
+    def test_plain_http_to_a_remote_host_is_reported(self):
+        warnings = self._warnings(TARGET_BASE_URL="http://example.com/v1")
+        self.assertTrue(any("plain http" in w for w in warnings), warnings)
+
+    def test_localhost_http_is_fine(self):
+        warnings = self._warnings(TARGET_BASE_URL="http://localhost:8080/v1")
+        self.assertFalse(any("plain http" in w for w in warnings))
+
+    def test_output_budget_larger_than_context_is_reported(self):
+        warnings = self._warnings(
+            MODEL_CONTEXT_TOKENS_EXPLICIT=True, MODEL_CONTEXT_TOKENS=8000, MODEL_MAX_OUTPUT_TOKENS=16000
+        )
+        self.assertTrue(any("no room" in w for w in warnings), warnings)
+
+    def test_warnings_print_to_stderr_with_a_stable_prefix(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            main.config.report_config_warnings(["one", "two"])
+        text = buf.getvalue()
+        self.assertEqual(text.count("[auggie-launch] config warning:"), 2)
